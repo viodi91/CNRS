@@ -667,6 +667,7 @@ class App(tk.Tk):
         self.axes = {}
         self.canvases = {}
         self.lines_by_chip_th = {}
+        self.last_analysis_mode = ANALYSIS_GAUSSIAN
         self._build_ui()
         self.refresh_ports()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -828,30 +829,30 @@ class App(tk.Tk):
         self.zero_streak_var = tk.StringVar(value="2")
         ttk.Entry(scan, textvariable=self.zero_streak_var, width=10).grid(row=7, column=1, sticky="w")
 
-        analysis_box = ttk.LabelFrame(scan, text="Sections d'analyse", padding=6)
-        analysis_box.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        analysis_tabs_box = ttk.LabelFrame(scan, text="Analyses", padding=6)
+        analysis_tabs_box.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
-        self.analysis_mode_var = tk.StringVar(value=ANALYSIS_GAUSSIAN)
-        ttk.Radiobutton(
-            analysis_box,
-            text="1) Analyse bruit (gaussienne, µ par TH/IC)",
-            variable=self.analysis_mode_var,
-            value=ANALYSIS_GAUSSIAN,
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(
-            analysis_box,
-            text="2) Analyse sigmoïde (point d'inflexion)",
-            variable=self.analysis_mode_var,
-            value=ANALYSIS_SIGMOID,
-        ).grid(row=1, column=0, sticky="w")
+        self.analysis_notebook = ttk.Notebook(analysis_tabs_box)
+        self.analysis_notebook.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(analysis_box, text="TH à scanner").grid(row=2, column=0, sticky="w", pady=(4, 0))
-        th_sel_frame = ttk.Frame(analysis_box)
-        th_sel_frame.grid(row=3, column=0, sticky="w")
-        self.th_vars = []
+        noise_tab = ttk.Frame(self.analysis_notebook, padding=6)
+        signal_tab = ttk.Frame(self.analysis_notebook, padding=6)
+        self.analysis_notebook.add(noise_tab, text="Analyse bruit")
+        self.analysis_notebook.add(signal_tab, text="Analyse signal")
+
+        ttk.Label(
+            noise_tab,
+            text="Scan gaussien automatique sur TH0..TH2\nEstimation µ/σ pour chaque IC et chaque TH.",
+            justify=tk.LEFT,
+        ).pack(anchor="w")
+
+        ttk.Label(signal_tab, text="TH à scanner pour la sigmoïde").pack(anchor="w")
+        th_sel_frame = ttk.Frame(signal_tab)
+        th_sel_frame.pack(anchor="w", pady=(4, 0))
+        self.signal_th_vars = []
         for th in range(NUM_THRESHOLDS):
             var = tk.BooleanVar(value=True)
-            self.th_vars.append(var)
+            self.signal_th_vars.append(var)
             ttk.Checkbutton(th_sel_frame, text=f"TH{th}", variable=var).pack(side=tk.LEFT, padx=(0, 6))
 
 
@@ -1010,12 +1011,18 @@ class App(tk.Tk):
             use_mux = bool(self.use_mux_var.get())
             mux_value = self.mux_var.get().strip()
             chips = [i for i, v in enumerate(self.ic_vars) if v.get()]
-            thresholds = [i for i, v in enumerate(self.th_vars) if v.get()]
-            analysis_mode = self.analysis_mode_var.get().strip()
+            selected_analysis_tab = self.analysis_notebook.tab(self.analysis_notebook.select(), "text")
+            if selected_analysis_tab == "Analyse signal":
+                analysis_mode = ANALYSIS_SIGMOID
+                thresholds = [i for i, v in enumerate(self.signal_th_vars) if v.get()]
+            else:
+                analysis_mode = ANALYSIS_GAUSSIAN
+                thresholds = list(range(NUM_THRESHOLDS))
+            self.last_analysis_mode = analysis_mode
 
             if not chips:
                 raise RuntimeError("Aucun IC sélectionné")
-            if not thresholds:
+            if analysis_mode == ANALYSIS_SIGMOID and not thresholds:
                 raise RuntimeError("Aucun TH sélectionné")
 
             stop_on_zero = self.stop_on_zero_var.get()
@@ -1118,7 +1125,7 @@ class App(tk.Tk):
 
     def on_scan_done(self):
         self.review_mode = True
-        if self.analysis_mode_var.get() == ANALYSIS_SIGMOID:
+        if self.last_analysis_mode == ANALYSIS_SIGMOID:
             self.status_var.set("Scan completed - validate point d'inflexion manuellement (clic gauche)")
         else:
             self.status_var.set("Scan completed - validate µ and µ-3σ manually")
@@ -1226,7 +1233,7 @@ class App(tk.Tk):
         is_right = (event.button == 3) or (event.button == MouseButton.RIGHT)
 
         if is_left:
-            if self.analysis_mode_var.get() == ANALYSIS_SIGMOID:
+            if self.last_analysis_mode == ANALYSIS_SIGMOID:
                 self.manual_selections[key]["inflection"] = selected_dac
                 self._log(f"Manual inflection selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
                 self.status_var.set(f"Inflection selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
