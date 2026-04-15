@@ -32,6 +32,7 @@ class CsvOverlayViewer(tk.Tk):
 
         self.chip_var = tk.IntVar(value=1)
         self.show_th_vars = [tk.BooleanVar(value=True) for _ in range(3)]
+        self.save_ic_vars = [tk.BooleanVar(value=True) for _ in range(3)]
 
         self._build_ui()
 
@@ -58,6 +59,16 @@ class CsvOverlayViewer(tk.Tk):
 
         ttk.Button(top, text="Rafraîchir", command=self.refresh_plot).pack(side=tk.LEFT, padx=8)
         ttk.Button(top, text="Effacer", command=self.clear_data).pack(side=tk.LEFT, padx=8)
+
+        save_box = ttk.LabelFrame(top, text="Enregistrer données (IC)", padding=4)
+        save_box.pack(side=tk.LEFT, padx=(16, 0))
+        for chip in range(3):
+            ttk.Checkbutton(
+                save_box,
+                text=f"IC{chip + 1}",
+                variable=self.save_ic_vars[chip],
+            ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(save_box, text="Exporter CSV filtré...", command=self.export_filtered_csv).pack(side=tk.LEFT, padx=8)
 
         self.status_var = tk.StringVar(value="Charge un ou plusieurs CSV noise_scan_raw.csv")
         ttk.Label(self, textvariable=self.status_var, padding=(8, 0)).pack(fill=tk.X)
@@ -111,6 +122,47 @@ class CsvOverlayViewer(tk.Tk):
 
         self.refresh_plot()
         self.status_var.set(f"{loaded} fichier(s) chargé(s) | {len(self.points)} points")
+
+    def export_filtered_csv(self):
+        if not self.points:
+            messagebox.showinfo("Export CSV", "Aucune donnée chargée.")
+            return
+
+        selected_ics = {i for i, v in enumerate(self.save_ic_vars) if v.get()}
+        if not selected_ics:
+            messagebox.showerror("Export CSV", "Sélectionne au moins un IC à exporter.")
+            return
+
+        selected_th = {i for i, v in enumerate(self.show_th_vars) if v.get()}
+        if not selected_th:
+            messagebox.showerror("Export CSV", "Sélectionne au moins un TH à exporter.")
+            return
+
+        out_path = filedialog.asksaveasfilename(
+            title="Exporter un CSV filtré",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Tous les fichiers", "*.*")],
+            initialfile="overlay_filtered.csv",
+        )
+        if not out_path:
+            return
+
+        filtered = [
+            p for p in self.points
+            if p.chip in selected_ics and p.threshold in selected_th
+        ]
+
+        if not filtered:
+            messagebox.showinfo("Export CSV", "Aucune ligne à exporter avec ce filtre.")
+            return
+
+        with Path(out_path).open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["source", "analysis_mode", "chip", "threshold", "dac", "hits_per_s"])
+            for p in filtered:
+                writer.writerow([p.source, p.mode, p.chip + 1, p.threshold, p.dac, p.hits_per_s])
+
+        self.status_var.set(f"CSV exporté: {out_path} ({len(filtered)} points)")
 
     @staticmethod
     def _to_int(row: dict, key: str, default: int = 0) -> int:
