@@ -33,6 +33,8 @@ VTHBL_REG = 3
 THRESHOLD_REGS = [4, 5, 6]     # TH0, TH1, TH2
 COUNTER_INDEXES = [0, 1, 2]    # c0, c1, c2
 COUNTER_MOD = 1 << 24
+ANALYSIS_GAUSSIAN = "gaussian"
+ANALYSIS_SIGMOID = "sigmoid"
 
 
 @dataclass
@@ -264,6 +266,8 @@ class NoiseScanEngine:
             do_zero_each_point,
             use_mux,
             mux_value,
+            analysis_mode,
+            thresholds,
             output_dir=None,
             chips=None,
             stop_on_zero=False,
@@ -279,7 +283,7 @@ class NoiseScanEngine:
 
         self.thread = threading.Thread(
             target=self._run,
-            args=(dwell_s, settle_s, do_zero_each_point, use_mux, mux_value, output_dir, chips, stop_on_zero, max_zero, dac_ranges),
+            args=(dwell_s, settle_s, do_zero_each_point, use_mux, mux_value, analysis_mode, thresholds, output_dir, chips, stop_on_zero, max_zero, dac_ranges),
             daemon=True,
         )
         self.thread.start()
@@ -326,6 +330,8 @@ class NoiseScanEngine:
             do_zero_each_point,
             use_mux,
             mux_value,
+            analysis_mode,
+            thresholds,
             output_dir,
             chips,
             stop_on_zero,
@@ -338,16 +344,16 @@ class NoiseScanEngine:
                 reply = self.fw.set_mux(mux_value)
                 self.log(f"MUX reply: {reply}")
 
-            total_scans = len(chips) * NUM_THRESHOLDS
+            total_scans = len(chips) * len(thresholds)
             scan_index = 0
             if dac_ranges is None:
                 dac_ranges = {
                     (chip, th): (255, 0)
                     for chip in chips
-                    for th in range(NUM_THRESHOLDS)
+                    for th in thresholds
                 }
             for chip in chips:
-                for th in range(NUM_THRESHOLDS):
+                for th in thresholds:
                     if self.stop_event.is_set():
                         self.on_status("Scan stopped by user")
                         return
@@ -435,7 +441,13 @@ class NoiseScanEngine:
                         if stop_on_zero and zero_hits_streak >= max_zero:
                             self.log(f"{max_zero} DAC consécutifs à 0 hits → stop TH")
                             break
-                        mu_est, sigma_est, r2_est = self._fit_gaussian_estimate(xs, ys)
+                        if analysis_mode == ANALYSIS_SIGMOID:
+                            inflect_est, sigmoid_r2 = self._fit_sigmoid_inflection(xs, ys)
+                            mu_est = inflect_est
+                            sigma_est = None
+                            r2_est = sigmoid_r2
+                        else:
+                            mu_est, sigma_est, r2_est = self._fit_gaussian_estimate(xs, ys)
 
 
                         # if r2_est is not None and r2_est > 0.92:
@@ -456,7 +468,11 @@ class NoiseScanEngine:
                         self.last_results.append(point)
                         self.on_point(point)
 
-                    final_mu, final_sigma, final_r2 = self._fit_gaussian_estimate(xs, ys)
+                    if analysis_mode == ANALYSIS_SIGMOID:
+                        final_inflect, final_r2 = self._fit_sigmoid_inflection(xs, ys)
+                        final_mu, final_sigma = final_inflect, None
+                    else:
+                        final_mu, final_sigma, final_r2 = self._fit_gaussian_estimate(xs, ys)
                     if output_dir:
                         self._save_plot(output_dir, chip, th, xs, ys)
                     mu_minus_3sigma = None
@@ -466,11 +482,13 @@ class NoiseScanEngine:
                     self.summary_rows.append({
                         "chip": chip + 1,
                         "threshold": th,
+                        "analysis_mode": analysis_mode,
                         "points": len(xs),
-                        "mu_auto": final_mu,
+                        "mu_auto": final_mu if analysis_mode == ANALYSIS_GAUSSIAN else None,
                         "sigma_auto": final_sigma,
                         "r2_auto": final_r2,
                         "mu_minus_3sigma_auto": mu_minus_3sigma,
+                        "inflection_auto": final_mu if analysis_mode == ANALYSIS_SIGMOID else None,
                         "best_dac": self._best_dac(xs, ys),
                         "max_hits_per_s": max(ys) if ys else None,
                     })
@@ -524,6 +542,38 @@ class NoiseScanEngine:
         sigma_dac = int(round(sigma))
         return mu_dac, sigma_dac, r2
 
+    @staticmethod
+    def _fit_sigmoid_inflection(xs: list[int], ys: list[float]) -> tuple[int | None, float | None]:
+        if len(xs) < 5 or len(ys) < 5:
+            return None, None
+
+        pairs = [(float(x), float(y)) for x, y in zip(xs, ys)]
+        pairs.sort(key=lambda p: p[0])
+        x = [p[0] for p in pairs]
+        y = [p[1] for p in pairs]
+
+        y_min = min(y)
+        y_max = max(y)
+        amp = y_max - y_min
+        if amp <= 1e-9:
+            return None, None
+
+        mid = y_min + 0.5 * amp
+        idx = min(range(len(y)), key=lambda i: abs(y[i] - mid))
+        x0 = x[idx]
+
+        x_left = x[0]
+        x_right = x[-1]
+        scale = max((x_right - x_left) / 8.0, 1.0)
+
+        y_hat = [y_min + amp / (1.0 + math.exp(-(xx - x0) / scale)) for xx in x]
+        y_mean = sum(y) / len(y)
+        ss_res = sum((yy - yhh) ** 2 for yy, yhh in zip(y, y_hat))
+        ss_tot = sum((yy - y_mean) ** 2 for yy in y)
+        r2 = 0.0 if ss_tot <= 1e-12 else 1.0 - (ss_res / ss_tot)
+
+        return int(round(x0)), r2
+
     def save_results(
         self,
         outdir: Path,
@@ -559,15 +609,18 @@ class NoiseScanEngine:
             wr.writerow([
                 "chip",
                 "threshold",
+                "analysis_mode",
                 "points",
                 "mu_auto",
                 "sigma_auto",
                 "r2_auto",
                 "mu_minus_3sigma_auto",
+                "inflection_auto",
                 "best_dac",
                 "max_hits_per_s",
                 "mu_manual",
                 "mu_minus_3sigma_manual",
+                "inflection_manual",
             ])
 
             for row in self.summary_rows:
@@ -576,15 +629,18 @@ class NoiseScanEngine:
                 wr.writerow([
                     row["chip"],
                     row["threshold"],
+                    row.get("analysis_mode"),
                     row["points"],
                     row["mu_auto"],
                     row["sigma_auto"],
                     row["r2_auto"],
                     row["mu_minus_3sigma_auto"],
+                    row.get("inflection_auto"),
                     row["best_dac"],
                     row["max_hits_per_s"],
                     sel.get("mu"),
                     sel.get("mu_minus_3sigma"),
+                    sel.get("inflection"),
                 ])
 
 
@@ -772,6 +828,32 @@ class App(tk.Tk):
         self.zero_streak_var = tk.StringVar(value="2")
         ttk.Entry(scan, textvariable=self.zero_streak_var, width=10).grid(row=7, column=1, sticky="w")
 
+        analysis_box = ttk.LabelFrame(scan, text="Sections d'analyse", padding=6)
+        analysis_box.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        self.analysis_mode_var = tk.StringVar(value=ANALYSIS_GAUSSIAN)
+        ttk.Radiobutton(
+            analysis_box,
+            text="1) Analyse bruit (gaussienne, µ par TH/IC)",
+            variable=self.analysis_mode_var,
+            value=ANALYSIS_GAUSSIAN,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            analysis_box,
+            text="2) Analyse sigmoïde (point d'inflexion)",
+            variable=self.analysis_mode_var,
+            value=ANALYSIS_SIGMOID,
+        ).grid(row=1, column=0, sticky="w")
+
+        ttk.Label(analysis_box, text="TH à scanner").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        th_sel_frame = ttk.Frame(analysis_box)
+        th_sel_frame.grid(row=3, column=0, sticky="w")
+        self.th_vars = []
+        for th in range(NUM_THRESHOLDS):
+            var = tk.BooleanVar(value=True)
+            self.th_vars.append(var)
+            ttk.Checkbutton(th_sel_frame, text=f"TH{th}", variable=var).pack(side=tk.LEFT, padx=(0, 6))
+
 
         actions = ttk.LabelFrame(top, text="Actions", padding=8)
         actions.pack(side=tk.LEFT, fill=tk.Y)
@@ -928,9 +1010,13 @@ class App(tk.Tk):
             use_mux = bool(self.use_mux_var.get())
             mux_value = self.mux_var.get().strip()
             chips = [i for i, v in enumerate(self.ic_vars) if v.get()]
+            thresholds = [i for i, v in enumerate(self.th_vars) if v.get()]
+            analysis_mode = self.analysis_mode_var.get().strip()
 
             if not chips:
                 raise RuntimeError("Aucun IC sélectionné")
+            if not thresholds:
+                raise RuntimeError("Aucun TH sélectionné")
 
             stop_on_zero = self.stop_on_zero_var.get()
 
@@ -955,7 +1041,8 @@ class App(tk.Tk):
             for chip in range(NUM_CHIPS):
                 self.refresh_chip_plot(chip)
 
-            self._log("Starting scan...")
+            mode_label = "gaussienne" if analysis_mode == ANALYSIS_GAUSSIAN else "sigmoïde"
+            self._log(f"Starting scan ({mode_label})...")
 
             outdir = filedialog.askdirectory(title="Optional output folder (Cancel = no autosave)")
             if not outdir:
@@ -968,6 +1055,8 @@ class App(tk.Tk):
                 do_zero_each_point=do_zero_each_point,
                 use_mux=use_mux,
                 mux_value=mux_value,
+                analysis_mode=analysis_mode,
+                thresholds=thresholds,
                 output_dir=outdir,
                 chips=chips,
                 stop_on_zero=stop_on_zero,
@@ -1029,7 +1118,10 @@ class App(tk.Tk):
 
     def on_scan_done(self):
         self.review_mode = True
-        self.status_var.set("Scan completed - validate µ and µ-3σ manually")
+        if self.analysis_mode_var.get() == ANALYSIS_SIGMOID:
+            self.status_var.set("Scan completed - validate point d'inflexion manuellement (clic gauche)")
+        else:
+            self.status_var.set("Scan completed - validate µ and µ-3σ manually")
         self._log("Review mode enabled")
 
         for chip in range(NUM_CHIPS):
@@ -1127,16 +1219,21 @@ class App(tk.Tk):
 
         key = (chip, clicked_th)
         if key not in self.manual_selections:
-            self.manual_selections[key] = {"mu": None, "mu_minus_3sigma": None}
+            self.manual_selections[key] = {"mu": None, "mu_minus_3sigma": None, "inflection": None}
 
         # bouton gauche / droit
         is_left = (event.button == 1) or (event.button == MouseButton.LEFT)
         is_right = (event.button == 3) or (event.button == MouseButton.RIGHT)
 
         if is_left:
-            self.manual_selections[key]["mu"] = selected_dac
-            self._log(f"Manual µ selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
-            self.status_var.set(f"µ selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
+            if self.analysis_mode_var.get() == ANALYSIS_SIGMOID:
+                self.manual_selections[key]["inflection"] = selected_dac
+                self._log(f"Manual inflection selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
+                self.status_var.set(f"Inflection selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
+            else:
+                self.manual_selections[key]["mu"] = selected_dac
+                self._log(f"Manual µ selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
+                self.status_var.set(f"µ selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
         elif is_right:
             self.manual_selections[key]["mu_minus_3sigma"] = selected_dac
             self._log(f"Manual µ-3σ selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
@@ -1180,6 +1277,7 @@ class App(tk.Tk):
             sel = self.manual_selections.get(key, {})
             mu_sel = sel.get("mu")
             mu3_sel = sel.get("mu_minus_3sigma")
+            inflection_sel = sel.get("inflection")
 
             for p in pts:
                 if mu_sel is not None and p.dac == mu_sel:
@@ -1189,6 +1287,10 @@ class App(tk.Tk):
                 if mu3_sel is not None and p.dac == mu3_sel:
                     ax.plot([p.dac], [p.hits_per_s], marker="s", markersize=11, linestyle="None")
                     ax.annotate(f"µ-3σ TH{th}", (p.dac, p.hits_per_s), textcoords="offset points", xytext=(8, -14))
+
+                if inflection_sel is not None and p.dac == inflection_sel:
+                    ax.plot([p.dac], [p.hits_per_s], marker="D", markersize=10, linestyle="None")
+                    ax.annotate(f"Infl. TH{th}", (p.dac, p.hits_per_s), textcoords="offset points", xytext=(8, 16))
 
         if all_x and all_y:
             xmin = min(all_x)
