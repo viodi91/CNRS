@@ -23,6 +23,18 @@ class CsvPoint:
     sigma_est: float | None = None
 
 
+@dataclass
+class SigmaTargetResult:
+    chip: int
+    threshold: int
+    mu_dac: int
+    target_hits: float
+    target_dac: int
+    target_hits_found: float
+    n_sigma: float | None
+    sigma_ref: float | None
+
+
 class CsvOverlayViewer(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -34,6 +46,7 @@ class CsvOverlayViewer(tk.Tk):
         self.hover_annotation = None
         self.plotted_artists = []
         self.manual_mu_by_chip_th: dict[tuple[int, int], int] = {}
+        self.sigma_targets_by_chip_th: dict[tuple[int, int], SigmaTargetResult] = {}
 
         self.chip_var = tk.IntVar(value=1)
         self.show_th_vars = [tk.BooleanVar(value=True) for _ in range(3)]
@@ -121,11 +134,13 @@ class CsvOverlayViewer(tk.Tk):
         self.points.clear()
         self.sources.clear()
         self.manual_mu_by_chip_th.clear()
+        self.sigma_targets_by_chip_th.clear()
         self.refresh_plot()
         self.status_var.set("Données effacées")
 
     def clear_manual_mu(self):
         self.manual_mu_by_chip_th.clear()
+        self.sigma_targets_by_chip_th.clear()
         self.refresh_plot()
         self.status_var.set("Sélections µ supprimées")
 
@@ -192,9 +207,38 @@ class CsvOverlayViewer(tk.Tk):
 
         with Path(out_path).open("w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["source", "analysis_mode", "chip", "threshold", "dac", "hits_per_s"])
+            writer.writerow([
+                "source",
+                "analysis_mode",
+                "chip",
+                "threshold",
+                "dac",
+                "hits_per_s",
+                "mu_user_dac",
+                "target_hits_requested",
+                "target_dac_for_hits",
+                "target_hits_found",
+                "n_sigma_from_mu",
+                "sigma_ref",
+            ])
             for p in filtered:
-                writer.writerow([p.source, p.mode, p.chip + 1, p.threshold, p.dac, p.hits_per_s])
+                key = (p.chip, p.threshold)
+                mu_user = self.manual_mu_by_chip_th.get(key)
+                tgt = self.sigma_targets_by_chip_th.get(key)
+                writer.writerow([
+                    p.source,
+                    p.mode,
+                    p.chip + 1,
+                    p.threshold,
+                    p.dac,
+                    p.hits_per_s,
+                    mu_user,
+                    tgt.target_hits if tgt else None,
+                    tgt.target_dac if tgt else None,
+                    tgt.target_hits_found if tgt else None,
+                    tgt.n_sigma if tgt else None,
+                    tgt.sigma_ref if tgt else None,
+                ])
 
         self.status_var.set(f"CSV exporté: {out_path} ({len(filtered)} points)")
 
@@ -384,6 +428,28 @@ class CsvOverlayViewer(tk.Tk):
                 mu_dac = self.manual_mu_by_chip_th[mu_key]
                 self.ax.axvline(mu_dac, linestyle="--", linewidth=1.0, color=line.get_color(), alpha=0.8)
 
+            target = self.sigma_targets_by_chip_th.get((chip, th))
+            if target is not None:
+                self.ax.scatter(
+                    [target.target_dac],
+                    [target.target_hits_found],
+                    marker="X",
+                    s=80,
+                    color=line.get_color(),
+                    edgecolors="black",
+                    linewidths=0.5,
+                    zorder=4,
+                )
+                txt = f"TH{th} → DAC {target.target_dac}"
+                self.ax.annotate(
+                    txt,
+                    (target.target_dac, target.target_hits_found),
+                    textcoords="offset points",
+                    xytext=(6, 6),
+                    fontsize=8,
+                    color=line.get_color(),
+                )
+
         self.ax.legend(fontsize=8)
         self.canvas.draw_idle()
 
@@ -410,6 +476,7 @@ class CsvOverlayViewer(tk.Tk):
             return
 
         self.manual_mu_by_chip_th[(best.chip, best.threshold)] = best.dac
+        self.sigma_targets_by_chip_th.pop((best.chip, best.threshold), None)
         self.status_var.set(f"µ manuel défini: IC{best.chip + 1} TH{best.threshold} -> DAC={best.dac}")
         self.refresh_plot()
 
@@ -428,6 +495,7 @@ class CsvOverlayViewer(tk.Tk):
             return
 
         lines: list[str] = []
+        self.sigma_targets_by_chip_th.clear()
         for (chip, th), mu_dac in sorted(self.manual_mu_by_chip_th.items()):
             pts = [p for p in self.points if p.chip == chip and p.threshold == th]
             if not pts:
@@ -441,12 +509,32 @@ class CsvOverlayViewer(tk.Tk):
 
             if sigma_ref and sigma_ref > 0:
                 n_sigma = (mu_dac - target_point.dac) / sigma_ref
+                self.sigma_targets_by_chip_th[(chip, th)] = SigmaTargetResult(
+                    chip=chip,
+                    threshold=th,
+                    mu_dac=mu_dac,
+                    target_hits=target_hits,
+                    target_dac=target_point.dac,
+                    target_hits_found=target_point.hits_per_s,
+                    n_sigma=n_sigma,
+                    sigma_ref=sigma_ref,
+                )
                 lines.append(
                     f"IC{chip + 1} TH{th}: µ={mu_dac}, cible≤{target_hits:.3f} hits/s à DAC={target_point.dac} "
                     f"(~µ-{n_sigma:.2f}σ, σ≈{sigma_ref:.2f})"
                 )
             else:
                 delta = mu_dac - target_point.dac
+                self.sigma_targets_by_chip_th[(chip, th)] = SigmaTargetResult(
+                    chip=chip,
+                    threshold=th,
+                    mu_dac=mu_dac,
+                    target_hits=target_hits,
+                    target_dac=target_point.dac,
+                    target_hits_found=target_point.hits_per_s,
+                    n_sigma=None,
+                    sigma_ref=None,
+                )
                 lines.append(
                     f"IC{chip + 1} TH{th}: µ={mu_dac}, cible≤{target_hits:.3f} hits/s à DAC={target_point.dac} "
                     f"(écart µ-DAC={delta}, sigma non disponible)"
@@ -458,6 +546,7 @@ class CsvOverlayViewer(tk.Tk):
 
         msg = "\n".join(lines)
         self.info_var.set(lines[0])
+        self.refresh_plot()
         messagebox.showinfo("Estimation µ-xσ", msg)
 
     def on_mouse_move(self, event):
