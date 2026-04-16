@@ -1,4 +1,7 @@
 import math
+import argparse
+import subprocess
+import sys
 import threading
 import time
 import csv
@@ -652,7 +655,7 @@ class NoiseScanEngine:
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, auto_port: str | None = None):
         super().__init__()
         self.title("AlphaBeast Serial Noise Scan GUI")
         self.geometry("1400x900")
@@ -677,7 +680,17 @@ class App(tk.Tk):
         self.last_analysis_mode = ANALYSIS_GAUSSIAN
         self._build_ui()
         self.refresh_ports()
+        if auto_port:
+            self.port_var.set(auto_port)
+            self.after(250, self._auto_connect_port)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _auto_connect_port(self):
+        if self.fw.is_open():
+            return
+        if not self.port_var.get().strip():
+            return
+        self.toggle_connect()
     def pause_scan(self):
         self.engine.pause()
         self._log("Scan paused")
@@ -745,6 +758,14 @@ class App(tk.Tk):
         self.port_cb = ttk.Combobox(conn, textvariable=self.port_var, width=18, state="readonly")
         self.port_cb.grid(row=0, column=1, padx=4)
         ttk.Button(conn, text="Refresh", command=self.refresh_ports).grid(row=0, column=2, padx=4)
+        ttk.Label(conn, text="Multi-ESP").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.multi_ports_listbox = tk.Listbox(conn, selectmode=tk.MULTIPLE, height=4, exportselection=False)
+        self.multi_ports_listbox.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(
+            conn,
+            text="Open selected in new windows",
+            command=self.open_selected_ports_in_new_windows,
+        ).grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 0))
 
         ttk.Label(conn, text="Baud").grid(row=1, column=0, sticky="w")
         self.baud_var = tk.StringVar(value="115200")
@@ -976,8 +997,26 @@ class App(tk.Tk):
     def refresh_ports(self):
         ports = [p.device for p in list_ports.comports()]
         self.port_cb["values"] = ports
+        self.multi_ports_listbox.delete(0, tk.END)
+        for p in ports:
+            self.multi_ports_listbox.insert(tk.END, p)
         if ports and not self.port_var.get():
             self.port_var.set(ports[0])
+
+    def open_selected_ports_in_new_windows(self):
+        sel = self.multi_ports_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("Multi-ESP", "Sélectionne au moins un port.")
+            return
+
+        ports = [self.multi_ports_listbox.get(i) for i in sel]
+        script = str(Path(__file__).resolve())
+        for port in ports:
+            try:
+                subprocess.Popen([sys.executable, script, "--port", port])
+                self._log(f"Opened new window for {port}")
+            except Exception as e:
+                self._log(f"Failed opening {port}: {e}")
 
     def toggle_connect(self):
 
@@ -1349,5 +1388,8 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = App()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", default=None, help="Auto-connect serial port at startup (for multi-ESP windows)")
+    args = parser.parse_args()
+    app = App(auto_port=args.port)
     app.mainloop()
