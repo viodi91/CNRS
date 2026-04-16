@@ -195,6 +195,21 @@ class FirmwareSerialText:
             timeout=timeout,
         )
 
+    def read_esp_id(self, timeout: float = 2.0) -> int | None:
+        reply = self.send_and_expect_one_of(
+            "ID?",
+            accepted_prefixes=["ESP_abeast_ID=", "ERR"],
+            timeout=timeout,
+        )
+        if reply.startswith("ERR"):
+            return None
+        if "=" not in reply:
+            return None
+        try:
+            return int(reply.split("=", 1)[1].strip())
+        except Exception:
+            return None
+
     def read_cntcsv(self, timeout: float = 2.0) -> dict[int, tuple[int, int, int]]:
         with self.lock:
             self._require_open()
@@ -256,6 +271,13 @@ class NoiseScanEngine:
         self.summary_rows: list[dict] = []
         self.pause_event = threading.Event()
         self.skip_threshold_event = threading.Event()
+        self.session_esp_id: int | None = None
+        self.session_port: str | None = None
+
+    def set_session_info(self, esp_id: int | None, port: str | None):
+        self.session_esp_id = esp_id
+        self.session_port = port
+
     def is_running(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
 
@@ -591,6 +613,7 @@ class NoiseScanEngine:
         with raw_path.open("w", newline="", encoding="utf-8") as f:
             wr = csv.writer(f)
             wr.writerow([
+                "esp_abeast_id", "serial_port",
                 "chip", "threshold", "dac", "hits_per_s",
                 "count0", "count1", "dt_s",
                 "mu_est", "sigma_est", "r2_est"
@@ -599,6 +622,8 @@ class NoiseScanEngine:
                 if p.chip not in selected_chips:
                     continue
                 wr.writerow([
+                    self.session_esp_id,
+                    self.session_port,
                     p.chip + 1,
                     p.threshold,
                     p.dac,
@@ -615,6 +640,8 @@ class NoiseScanEngine:
         with summary_path.open("w", newline="", encoding="utf-8") as f:
             wr = csv.writer(f)
             wr.writerow([
+                "esp_abeast_id",
+                "serial_port",
                 "chip",
                 "threshold",
                 "analysis_mode",
@@ -637,6 +664,8 @@ class NoiseScanEngine:
                     continue
                 sel = manual_selections.get(key, {})
                 wr.writerow([
+                    self.session_esp_id,
+                    self.session_port,
                     row["chip"],
                     row["threshold"],
                     row.get("analysis_mode"),
@@ -678,6 +707,8 @@ class App(tk.Tk):
         self.canvases = {}
         self.lines_by_chip_th = {}
         self.last_analysis_mode = ANALYSIS_GAUSSIAN
+        self.connected_esp_id: int | None = None
+        self.connected_port: str | None = None
         self._build_ui()
         self.refresh_ports()
         if auto_port:
@@ -1027,16 +1058,27 @@ class App(tk.Tk):
                 self.connect_btn.configure(text="Connect")
                 self.status_var.set("Disconnected")
                 self._log("Serial port closed")
+                self.connected_esp_id = None
+                self.connected_port = None
+                self.engine.set_session_info(None, None)
                 return
 
             port = self.port_var.get().strip()
             baud = int(self.baud_var.get().strip())
 
             self.fw.open(port, baudrate=baud, timeout=0.2)
+            esp_id = self.fw.read_esp_id(timeout=2.0)
+            self.connected_esp_id = esp_id
+            self.connected_port = port
+            self.engine.set_session_info(esp_id=esp_id, port=port)
 
             self.connect_btn.configure(text="Disconnect")
-            self.status_var.set(f"Connected to {port} @ {baud}")
-            self._log(f"Connected to {port} @ {baud}")
+            if esp_id is None:
+                self.status_var.set(f"Connected to {port} @ {baud} | ESP_ID=?")
+                self._log(f"Connected to {port} @ {baud} | ESP_abeast_ID unknown")
+            else:
+                self.status_var.set(f"Connected to {port} @ {baud} | ESP_ID={esp_id}")
+                self._log(f"Connected to {port} @ {baud} | ESP_abeast_ID={esp_id}")
 
             # 👇 AJOUTER ICI
             self.after(600, self.load_vthbl_defaults)
