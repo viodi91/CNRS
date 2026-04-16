@@ -578,8 +578,11 @@ class NoiseScanEngine:
         self,
         outdir: Path,
         manual_selections: dict[tuple[int, int], dict[str, int | None]],
+        selected_chips: set[int] | None = None,
     ):
         outdir.mkdir(parents=True, exist_ok=True)
+        if selected_chips is None:
+            selected_chips = set(range(NUM_CHIPS))
 
         raw_path = outdir / "noise_scan_raw.csv"
         with raw_path.open("w", newline="", encoding="utf-8") as f:
@@ -590,6 +593,8 @@ class NoiseScanEngine:
                 "mu_est", "sigma_est", "r2_est"
             ])
             for p in self.last_results:
+                if p.chip not in selected_chips:
+                    continue
                 wr.writerow([
                     p.chip + 1,
                     p.threshold,
@@ -625,6 +630,8 @@ class NoiseScanEngine:
 
             for row in self.summary_rows:
                 key = (row["chip"] - 1, row["threshold"])
+                if key[0] not in selected_chips:
+                    continue
                 sel = manual_selections.get(key, {})
                 wr.writerow([
                     row["chip"],
@@ -875,6 +882,15 @@ class App(tk.Tk):
         ttk.Button(actions, text="Suivant sans sélectionner", command=self.skip_and_next).pack(fill=tk.X, pady=2)
 
         ttk.Separator(actions, orient="horizontal").pack(fill=tk.X, pady=6)
+
+        export_box = ttk.LabelFrame(actions, text="Export CSV (IC)", padding=4)
+        export_box.pack(fill=tk.X, pady=(0, 4))
+        self.export_ic_vars = []
+        for i in range(NUM_CHIPS):
+            var = tk.BooleanVar(value=True)
+            self.export_ic_vars.append(var)
+            ttk.Checkbutton(export_box, text=f"IC{i + 1}", variable=var).pack(side=tk.LEFT, padx=2)
+
         ttk.Button(actions, text="Save validated CSV...", command=self.save_csv_dialog).pack(fill=tk.X, pady=2)
 
         help_box = ttk.LabelFrame(top, text="Manual validation", padding=8)
@@ -1081,13 +1097,18 @@ class App(tk.Tk):
         if not self.engine.last_results:
             messagebox.showinfo("No data", "No acquired points to save")
             return
+        selected_chips = {i for i, v in enumerate(self.export_ic_vars) if v.get()}
+        if not selected_chips:
+            messagebox.showerror("Export error", "Sélectionne au moins un IC à exporter")
+            return
 
         outdir = filedialog.askdirectory(title="Choose output folder")
         if not outdir:
             return
 
-        self.engine.save_results(Path(outdir), self.manual_selections)
-        self._log(f"Saved validated CSV files to {outdir}")
+        self.engine.save_results(Path(outdir), self.manual_selections, selected_chips=selected_chips)
+        chips_txt = ", ".join(f"IC{i + 1}" for i in sorted(selected_chips))
+        self._log(f"Saved validated CSV files to {outdir} ({chips_txt})")
 
     def _threadsafe_log(self, msg: str):
         self.after(0, lambda: self._log(msg))
