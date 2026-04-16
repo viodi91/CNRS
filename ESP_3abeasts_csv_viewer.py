@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZipFile
 import xml.etree.ElementTree as ET
+import statistics
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -19,6 +20,7 @@ class CsvPoint:
     dac: int
     hits_per_s: float
     mode: str  # gaussian | sigmoid | unknown
+    sigma_est: float | None = None
 
 
 class CsvOverlayViewer(tk.Tk):
@@ -31,10 +33,13 @@ class CsvOverlayViewer(tk.Tk):
         self.sources: list[str] = []
         self.hover_annotation = None
         self.plotted_artists = []
+        self.manual_mu_by_chip_th: dict[tuple[int, int], int] = {}
 
         self.chip_var = tk.IntVar(value=1)
         self.show_th_vars = [tk.BooleanVar(value=True) for _ in range(3)]
         self.save_ic_vars = [tk.BooleanVar(value=True) for _ in range(3)]
+        self.pick_mu_mode = tk.BooleanVar(value=False)
+        self.target_hits_var = tk.DoubleVar(value=1000.0)
 
         self._build_ui()
 
@@ -61,6 +66,18 @@ class CsvOverlayViewer(tk.Tk):
 
         ttk.Button(top, text="Rafraîchir", command=self.refresh_plot).pack(side=tk.LEFT, padx=8)
         ttk.Button(top, text="Effacer", command=self.clear_data).pack(side=tk.LEFT, padx=8)
+
+        pick_box = ttk.LabelFrame(top, text="Sélection µ / sigma", padding=4)
+        pick_box.pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Checkbutton(
+            pick_box,
+            text="Cliquer pour définir µ",
+            variable=self.pick_mu_mode,
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Label(pick_box, text="Hits/s cible").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(pick_box, textvariable=self.target_hits_var, width=10).pack(side=tk.LEFT)
+        ttk.Button(pick_box, text="Calculer µ-xσ", command=self.compute_sigma_targets).pack(side=tk.LEFT, padx=6)
+        ttk.Button(pick_box, text="Reset µ", command=self.clear_manual_mu).pack(side=tk.LEFT, padx=4)
 
         save_box = ttk.LabelFrame(top, text="Enregistrer données (IC)", padding=4)
         save_box.pack(side=tk.LEFT, padx=(16, 0))
@@ -91,16 +108,26 @@ class CsvOverlayViewer(tk.Tk):
         toolbar = NavigationToolbar2Tk(self.canvas, canvas_frame)
         toolbar.update()
 
-        self.info_var = tk.StringVar(value="Survole un point pour voir les valeurs (source, IC, TH, DAC, hits/s)")
+        self.info_var = tk.StringVar(
+            value="Survole un point pour voir les valeurs (source, IC, TH, DAC, hits/s). "
+                  "Active 'Cliquer pour définir µ' puis clique un point pour fixer µ."
+        )
         ttk.Label(self, textvariable=self.info_var, padding=8).pack(fill=tk.X)
 
         self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
+        self.canvas.mpl_connect("button_press_event", self.on_mouse_click)
 
     def clear_data(self):
         self.points.clear()
         self.sources.clear()
+        self.manual_mu_by_chip_th.clear()
         self.refresh_plot()
         self.status_var.set("Données effacées")
+
+    def clear_manual_mu(self):
+        self.manual_mu_by_chip_th.clear()
+        self.refresh_plot()
+        self.status_var.set("Sélections µ supprimées")
 
     def load_csv_files(self):
         files = filedialog.askopenfilenames(
@@ -291,6 +318,7 @@ class CsvOverlayViewer(tk.Tk):
         key_th = self._pick_key(rows[0], "threshold", "th")
         key_dac = self._pick_key(rows[0], "dac", "bestdac")
         key_hits = self._pick_key(rows[0], "hitspers", "hitss", "hits_per_s", "maxhitspers")
+        key_sigma = self._pick_key(rows[0], "sigmaest", "sigma_auto", "sigmaauto")
 
         if not all([key_chip, key_th, key_dac, key_hits]):
             raise ValueError("Colonnes attendues (ou alias): chip/ic, threshold/th, dac/best_dac, hits_per_s/max_hits_per_s")
@@ -313,6 +341,7 @@ class CsvOverlayViewer(tk.Tk):
                     dac=self._to_int(row, key_dac, 0),
                     hits_per_s=self._to_float(row, key_hits, 0.0),
                     mode=self._infer_mode(csv_path, row),
+                    sigma_est=self._to_float(row, key_sigma, 0.0) if key_sigma else None,
                 )
             )
         return points
@@ -323,6 +352,7 @@ class CsvOverlayViewer(tk.Tk):
         self.ax.set_xlabel("DAC")
         self.ax.set_ylabel("Hits/s")
         self.ax.set_title("Superposition des courbes")
+        self.ax.set_xlim(255, 0)
         self.plotted_artists.clear()
 
         chip = self.chip_var.get() - 1
@@ -349,24 +379,92 @@ class CsvOverlayViewer(tk.Tk):
             line = self.ax.plot(xs, ys, marker=markers.get(th, "o"), linewidth=1.3, label=label)[0]
             self.plotted_artists.append((line, pts_sorted))
 
+            mu_key = (chip, th)
+            if mu_key in self.manual_mu_by_chip_th:
+                mu_dac = self.manual_mu_by_chip_th[mu_key]
+                self.ax.axvline(mu_dac, linestyle="--", linewidth=1.0, color=line.get_color(), alpha=0.8)
+
         self.ax.legend(fontsize=8)
         self.canvas.draw_idle()
+
+    def _nearest_point(self, x: float, y: float) -> CsvPoint | None:
+        best = None
+        best_d2 = None
+        for _line, pts in self.plotted_artists:
+            for p in pts:
+                dx = p.dac - x
+                dy = p.hits_per_s - y
+                d2 = dx * dx + dy * dy
+                if best_d2 is None or d2 < best_d2:
+                    best_d2 = d2
+                    best = p
+        return best
+
+    def on_mouse_click(self, event):
+        if not self.pick_mu_mode.get():
+            return
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            return
+        best = self._nearest_point(event.xdata, event.ydata)
+        if best is None:
+            return
+
+        self.manual_mu_by_chip_th[(best.chip, best.threshold)] = best.dac
+        self.status_var.set(f"µ manuel défini: IC{best.chip + 1} TH{best.threshold} -> DAC={best.dac}")
+        self.refresh_plot()
+
+    def compute_sigma_targets(self):
+        if not self.points:
+            messagebox.showinfo("µ-xσ", "Aucune donnée chargée.")
+            return
+        try:
+            target_hits = float(self.target_hits_var.get())
+        except Exception:
+            messagebox.showerror("µ-xσ", "Valeur hits/s cible invalide.")
+            return
+
+        if not self.manual_mu_by_chip_th:
+            messagebox.showinfo("µ-xσ", "Définis au moins un µ manuel (clic sur un point).")
+            return
+
+        lines: list[str] = []
+        for (chip, th), mu_dac in sorted(self.manual_mu_by_chip_th.items()):
+            pts = [p for p in self.points if p.chip == chip and p.threshold == th]
+            if not pts:
+                continue
+            pts_sorted = sorted(pts, key=lambda p: abs(p.dac - mu_dac))
+            under = [p for p in pts_sorted if p.hits_per_s <= target_hits]
+            target_point = under[0] if under else min(pts, key=lambda p: p.hits_per_s)
+
+            sigma_vals = [p.sigma_est for p in pts if p.sigma_est is not None and p.sigma_est > 0]
+            sigma_ref = statistics.median(sigma_vals) if sigma_vals else None
+
+            if sigma_ref and sigma_ref > 0:
+                n_sigma = (mu_dac - target_point.dac) / sigma_ref
+                lines.append(
+                    f"IC{chip + 1} TH{th}: µ={mu_dac}, cible≤{target_hits:.3f} hits/s à DAC={target_point.dac} "
+                    f"(~µ-{n_sigma:.2f}σ, σ≈{sigma_ref:.2f})"
+                )
+            else:
+                delta = mu_dac - target_point.dac
+                lines.append(
+                    f"IC{chip + 1} TH{th}: µ={mu_dac}, cible≤{target_hits:.3f} hits/s à DAC={target_point.dac} "
+                    f"(écart µ-DAC={delta}, sigma non disponible)"
+                )
+
+        if not lines:
+            messagebox.showinfo("µ-xσ", "Aucun résultat exploitable.")
+            return
+
+        msg = "\n".join(lines)
+        self.info_var.set(lines[0])
+        messagebox.showinfo("Estimation µ-xσ", msg)
 
     def on_mouse_move(self, event):
         if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
             return
 
-        best = None
-        best_d2 = None
-
-        for _line, pts in self.plotted_artists:
-            for p in pts:
-                dx = p.dac - event.xdata
-                dy = p.hits_per_s - event.ydata
-                d2 = dx * dx + dy * dy
-                if best_d2 is None or d2 < best_d2:
-                    best_d2 = d2
-                    best = p
+        best = self._nearest_point(event.xdata, event.ydata)
 
         if best is None:
             return
