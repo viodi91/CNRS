@@ -35,6 +35,13 @@ class SigmaTargetResult:
     sigma_ref: float | None
 
 
+@dataclass
+class ParsedFileData:
+    points: list[CsvPoint]
+    manual_mu: dict[tuple[int, int], int]
+    sigma_targets: dict[tuple[int, int], SigmaTargetResult]
+
+
 class CsvOverlayViewer(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -160,10 +167,12 @@ class CsvOverlayViewer(tk.Tk):
         loaded = 0
         for f in files:
             try:
-                new_points = self._read_csv(Path(f))
-                if not new_points:
+                parsed = self._read_csv(Path(f))
+                if not parsed.points:
                     continue
-                self.points.extend(new_points)
+                self.points.extend(parsed.points)
+                self.manual_mu_by_chip_th.update(parsed.manual_mu)
+                self.sigma_targets_by_chip_th.update(parsed.sigma_targets)
                 self.sources.append(Path(f).name)
                 loaded += 1
             except Exception as e:
@@ -258,6 +267,30 @@ class CsvOverlayViewer(tk.Tk):
         except Exception:
             return default
 
+    @staticmethod
+    def _to_optional_int(row: dict, key: str | None) -> int | None:
+        if key is None:
+            return None
+        v = row.get(key, "")
+        if v is None or str(v).strip() == "":
+            return None
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _to_optional_float(row: dict, key: str | None) -> float | None:
+        if key is None:
+            return None
+        v = row.get(key, "")
+        if v is None or str(v).strip() == "":
+            return None
+        try:
+            return float(v)
+        except Exception:
+            return None
+
     def _infer_mode(self, csv_path: Path, row: dict) -> str:
         if "analysis_mode" in row and row.get("analysis_mode"):
             return str(row.get("analysis_mode")).strip().lower()
@@ -342,8 +375,10 @@ class CsvOverlayViewer(tk.Tk):
                 rows.append(dict(zip(header, padded)))
         return rows
 
-    def _read_csv(self, csv_path: Path) -> list[CsvPoint]:
+    def _read_csv(self, csv_path: Path) -> ParsedFileData:
         points: list[CsvPoint] = []
+        manual_mu: dict[tuple[int, int], int] = {}
+        sigma_targets: dict[tuple[int, int], SigmaTargetResult] = {}
         suffix = csv_path.suffix.lower()
         if suffix == ".xlsx":
             rows = self._rows_from_xlsx(csv_path)
@@ -356,13 +391,19 @@ class CsvOverlayViewer(tk.Tk):
                 rows = list(reader)
 
         if not rows:
-            return points
+            return ParsedFileData(points=points, manual_mu=manual_mu, sigma_targets=sigma_targets)
 
         key_chip = self._pick_key(rows[0], "chip", "ic")
         key_th = self._pick_key(rows[0], "threshold", "th")
         key_dac = self._pick_key(rows[0], "dac", "bestdac")
         key_hits = self._pick_key(rows[0], "hitspers", "hitss", "hits_per_s", "maxhitspers")
         key_sigma = self._pick_key(rows[0], "sigmaest", "sigma_auto", "sigmaauto")
+        key_mu_user = self._pick_key(rows[0], "muuserdac", "mu_manual", "mumanual")
+        key_target_hits = self._pick_key(rows[0], "targethitsrequested")
+        key_target_dac = self._pick_key(rows[0], "targetdacforhits")
+        key_target_hits_found = self._pick_key(rows[0], "targethitsfound")
+        key_n_sigma = self._pick_key(rows[0], "nsigmafrommu")
+        key_sigma_ref = self._pick_key(rows[0], "sigmaref")
 
         if not all([key_chip, key_th, key_dac, key_hits]):
             raise ValueError("Colonnes attendues (ou alias): chip/ic, threshold/th, dac/best_dac, hits_per_s/max_hits_per_s")
@@ -388,7 +429,30 @@ class CsvOverlayViewer(tk.Tk):
                     sigma_est=self._to_float(row, key_sigma, 0.0) if key_sigma else None,
                 )
             )
-        return points
+
+            key = (chip, th)
+            mu_user_val = self._to_optional_int(row, key_mu_user)
+            if mu_user_val is not None:
+                manual_mu[key] = mu_user_val
+
+            target_dac_val = self._to_optional_int(row, key_target_dac)
+            target_hits_found_val = self._to_optional_float(row, key_target_hits_found)
+            if target_dac_val is not None and target_hits_found_val is not None:
+                target_hits_val = self._to_optional_float(row, key_target_hits)
+                if target_hits_val is None:
+                    target_hits_val = target_hits_found_val
+                sigma_targets[key] = SigmaTargetResult(
+                    chip=chip,
+                    threshold=th,
+                    mu_dac=manual_mu.get(key, mu_user_val if mu_user_val is not None else target_dac_val),
+                    target_hits=target_hits_val,
+                    target_dac=target_dac_val,
+                    target_hits_found=target_hits_found_val,
+                    n_sigma=self._to_optional_float(row, key_n_sigma),
+                    sigma_ref=self._to_optional_float(row, key_sigma_ref),
+                )
+
+        return ParsedFileData(points=points, manual_mu=manual_mu, sigma_targets=sigma_targets)
 
     def refresh_plot(self):
         self.ax.clear()
