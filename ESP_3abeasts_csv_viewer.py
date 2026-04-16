@@ -1,6 +1,9 @@
 import csv
 from dataclasses import dataclass
 from pathlib import Path
+from zipfile import ZipFile
+import xml.etree.ElementTree as ET
+import statistics
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -17,6 +20,28 @@ class CsvPoint:
     dac: int
     hits_per_s: float
     mode: str  # gaussian | sigmoid | unknown
+    sigma_est: float | None = None
+    vth_bl: int | None = None
+
+
+@dataclass
+class SigmaTargetResult:
+    chip: int
+    threshold: int
+    mu_dac: int
+    target_hits: float
+    target_dac: int
+    target_hits_found: float
+    n_sigma: float | None
+    sigma_ref: float | None
+
+
+@dataclass
+class ParsedFileData:
+    points: list[CsvPoint]
+    manual_mu: dict[tuple[int, int], int]
+    sigma_targets: dict[tuple[int, int], SigmaTargetResult]
+    vthbl_by_chip: dict[int, int]
 
 
 class CsvOverlayViewer(tk.Tk):
@@ -29,10 +54,15 @@ class CsvOverlayViewer(tk.Tk):
         self.sources: list[str] = []
         self.hover_annotation = None
         self.plotted_artists = []
+        self.manual_mu_by_chip_th: dict[tuple[int, int], int] = {}
+        self.sigma_targets_by_chip_th: dict[tuple[int, int], SigmaTargetResult] = {}
+        self.vthbl_by_chip: dict[int, int] = {}
 
         self.chip_var = tk.IntVar(value=1)
         self.show_th_vars = [tk.BooleanVar(value=True) for _ in range(3)]
         self.save_ic_vars = [tk.BooleanVar(value=True) for _ in range(3)]
+        self.pick_mu_mode = tk.BooleanVar(value=False)
+        self.target_hits_var = tk.DoubleVar(value=1000.0)
 
         self._build_ui()
 
@@ -59,6 +89,18 @@ class CsvOverlayViewer(tk.Tk):
 
         ttk.Button(top, text="Rafraîchir", command=self.refresh_plot).pack(side=tk.LEFT, padx=8)
         ttk.Button(top, text="Effacer", command=self.clear_data).pack(side=tk.LEFT, padx=8)
+
+        pick_box = ttk.LabelFrame(top, text="Sélection µ / sigma", padding=4)
+        pick_box.pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Checkbutton(
+            pick_box,
+            text="Cliquer pour définir µ",
+            variable=self.pick_mu_mode,
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Label(pick_box, text="Hits/s cible").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Entry(pick_box, textvariable=self.target_hits_var, width=10).pack(side=tk.LEFT)
+        ttk.Button(pick_box, text="Calculer µ-xσ", command=self.compute_sigma_targets).pack(side=tk.LEFT, padx=6)
+        ttk.Button(pick_box, text="Reset µ", command=self.clear_manual_mu).pack(side=tk.LEFT, padx=4)
 
         save_box = ttk.LabelFrame(top, text="Enregistrer données (IC)", padding=4)
         save_box.pack(side=tk.LEFT, padx=(16, 0))
@@ -89,21 +131,50 @@ class CsvOverlayViewer(tk.Tk):
         toolbar = NavigationToolbar2Tk(self.canvas, canvas_frame)
         toolbar.update()
 
-        self.info_var = tk.StringVar(value="Survole un point pour voir les valeurs (source, IC, TH, DAC, hits/s)")
+        self.info_var = tk.StringVar(
+            value="Survole un point pour voir les valeurs (source, IC, TH, DAC, hits/s). "
+                  "Active 'Cliquer pour définir µ' puis clique un point pour fixer µ."
+        )
         ttk.Label(self, textvariable=self.info_var, padding=8).pack(fill=tk.X)
 
+        summary_box = ttk.LabelFrame(self, text="Résumé IC/TH (fichier filtré)", padding=6)
+        summary_box.pack(fill=tk.X, padx=8, pady=(0, 6))
+        cols = ("ic", "th", "vth_bl", "mu", "mu_x_sigma", "hits_cible", "n_sigma")
+        self.summary_tree = ttk.Treeview(summary_box, columns=cols, show="headings", height=6)
+        for c, w in [("ic", 60), ("th", 60), ("vth_bl", 90), ("mu", 90), ("mu_x_sigma", 110), ("hits_cible", 110), ("n_sigma", 90)]:
+            self.summary_tree.heading(c, text=c)
+            self.summary_tree.column(c, width=w, anchor="center")
+        self.summary_tree.pack(fill=tk.X, expand=True)
+
         self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
+        self.canvas.mpl_connect("button_press_event", self.on_mouse_click)
 
     def clear_data(self):
         self.points.clear()
         self.sources.clear()
+        self.manual_mu_by_chip_th.clear()
+        self.sigma_targets_by_chip_th.clear()
+        self.vthbl_by_chip.clear()
+        self.refresh_summary_table()
         self.refresh_plot()
         self.status_var.set("Données effacées")
 
+    def clear_manual_mu(self):
+        self.manual_mu_by_chip_th.clear()
+        self.sigma_targets_by_chip_th.clear()
+        self.refresh_summary_table()
+        self.refresh_plot()
+        self.status_var.set("Sélections µ supprimées")
+
     def load_csv_files(self):
         files = filedialog.askopenfilenames(
-            title="Choisir un ou plusieurs CSV",
-            filetypes=[("CSV", "*.csv"), ("Tous les fichiers", "*.*")],
+            title="Choisir un ou plusieurs fichiers de données",
+            filetypes=[
+                ("Données", "*.csv *.xlsx"),
+                ("CSV", "*.csv"),
+                ("Excel", "*.xlsx"),
+                ("Tous les fichiers", "*.*"),
+            ],
         )
         if not files:
             return
@@ -111,16 +182,20 @@ class CsvOverlayViewer(tk.Tk):
         loaded = 0
         for f in files:
             try:
-                new_points = self._read_csv(Path(f))
-                if not new_points:
+                parsed = self._read_csv(Path(f))
+                if not parsed.points:
                     continue
-                self.points.extend(new_points)
+                self.points.extend(parsed.points)
+                self.manual_mu_by_chip_th.update(parsed.manual_mu)
+                self.sigma_targets_by_chip_th.update(parsed.sigma_targets)
+                self.vthbl_by_chip.update(parsed.vthbl_by_chip)
                 self.sources.append(Path(f).name)
                 loaded += 1
             except Exception as e:
                 messagebox.showwarning("Lecture CSV", f"Impossible de lire {f}: {e}")
 
         self.refresh_plot()
+        self.refresh_summary_table()
         self.status_var.set(f"{loaded} fichier(s) chargé(s) | {len(self.points)} points")
 
     def export_filtered_csv(self):
@@ -158,9 +233,40 @@ class CsvOverlayViewer(tk.Tk):
 
         with Path(out_path).open("w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["source", "analysis_mode", "chip", "threshold", "dac", "hits_per_s"])
+            writer.writerow([
+                "source",
+                "analysis_mode",
+                "chip",
+                "threshold",
+                "dac",
+                "hits_per_s",
+                "vth_bl",
+                "mu_user_dac",
+                "target_hits_requested",
+                "target_dac_for_hits",
+                "target_hits_found",
+                "n_sigma_from_mu",
+                "sigma_ref",
+            ])
             for p in filtered:
-                writer.writerow([p.source, p.mode, p.chip + 1, p.threshold, p.dac, p.hits_per_s])
+                key = (p.chip, p.threshold)
+                mu_user = self.manual_mu_by_chip_th.get(key)
+                tgt = self.sigma_targets_by_chip_th.get(key)
+                writer.writerow([
+                    p.source,
+                    p.mode,
+                    p.chip + 1,
+                    p.threshold,
+                    p.dac,
+                    p.hits_per_s,
+                    p.vth_bl,
+                    mu_user,
+                    tgt.target_hits if tgt else None,
+                    tgt.target_dac if tgt else None,
+                    tgt.target_hits_found if tgt else None,
+                    tgt.n_sigma if tgt else None,
+                    tgt.sigma_ref if tgt else None,
+                ])
 
         self.status_var.set(f"CSV exporté: {out_path} ({len(filtered)} points)")
 
@@ -180,6 +286,30 @@ class CsvOverlayViewer(tk.Tk):
         except Exception:
             return default
 
+    @staticmethod
+    def _to_optional_int(row: dict, key: str | None) -> int | None:
+        if key is None:
+            return None
+        v = row.get(key, "")
+        if v is None or str(v).strip() == "":
+            return None
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _to_optional_float(row: dict, key: str | None) -> float | None:
+        if key is None:
+            return None
+        v = row.get(key, "")
+        if v is None or str(v).strip() == "":
+            return None
+        try:
+            return float(v)
+        except Exception:
+            return None
+
     def _infer_mode(self, csv_path: Path, row: dict) -> str:
         if "analysis_mode" in row and row.get("analysis_mode"):
             return str(row.get("analysis_mode")).strip().lower()
@@ -191,37 +321,189 @@ class CsvOverlayViewer(tk.Tk):
             return "gaussian"
         return "unknown"
 
-    def _read_csv(self, csv_path: Path) -> list[CsvPoint]:
+    @staticmethod
+    def _normalize_key(value: str) -> str:
+        return "".join(ch for ch in str(value).strip().lower() if ch.isalnum())
+
+    def _pick_key(self, row: dict, *aliases: str) -> str | None:
+        if not row:
+            return None
+        normalized = {self._normalize_key(k): k for k in row.keys()}
+        for alias in aliases:
+            if alias in normalized:
+                return normalized[alias]
+        return None
+
+    def _rows_from_xlsx(self, xlsx_path: Path) -> list[dict]:
+        rows: list[dict] = []
+        with ZipFile(xlsx_path) as zf:
+            shared_strings: list[str] = []
+            if "xl/sharedStrings.xml" in zf.namelist():
+                ss_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+                for si in ss_root.findall(".//{*}si"):
+                    txt = "".join(node.text or "" for node in si.findall(".//{*}t"))
+                    shared_strings.append(txt)
+
+            wb_root = ET.fromstring(zf.read("xl/workbook.xml"))
+            sheet_nodes = wb_root.findall(".//{*}sheet")
+            if not sheet_nodes:
+                return rows
+            first_sheet_rid = sheet_nodes[0].attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+            if not first_sheet_rid:
+                return rows
+
+            rels_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+            target = None
+            for rel in rels_root.findall(".//{*}Relationship"):
+                if rel.attrib.get("Id") == first_sheet_rid:
+                    target = rel.attrib.get("Target")
+                    break
+            if not target:
+                return rows
+
+            if target.startswith("/"):
+                sheet_path = target.lstrip("/")
+            else:
+                sheet_path = f"xl/{target}" if not target.startswith("xl/") else target
+
+            sheet_root = ET.fromstring(zf.read(sheet_path))
+
+            header: list[str] = []
+            for row in sheet_root.findall(".//{*}sheetData/{*}row"):
+                values: list[str] = []
+                for c in row.findall("{*}c"):
+                    v = c.find("{*}v")
+                    if v is None:
+                        values.append("")
+                        continue
+                    raw = v.text or ""
+                    if c.attrib.get("t") == "s":
+                        try:
+                            values.append(shared_strings[int(raw)])
+                        except Exception:
+                            values.append(raw)
+                    else:
+                        values.append(raw)
+
+                if not header:
+                    header = [str(h).strip() for h in values]
+                    continue
+                if not any(str(x).strip() for x in values):
+                    continue
+                padded = values + [""] * max(0, len(header) - len(values))
+                rows.append(dict(zip(header, padded)))
+        return rows
+
+    def _read_csv(self, csv_path: Path) -> ParsedFileData:
         points: list[CsvPoint] = []
-        with csv_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            needed = {"chip", "threshold", "dac", "hits_per_s"}
-            if not needed.issubset(set(reader.fieldnames or [])):
-                raise ValueError(
-                    "Colonnes attendues: chip, threshold, dac, hits_per_s (fichier noise_scan_raw.csv recommandé)"
+        manual_mu: dict[tuple[int, int], int] = {}
+        sigma_targets: dict[tuple[int, int], SigmaTargetResult] = {}
+        vthbl_by_chip: dict[int, int] = {}
+        suffix = csv_path.suffix.lower()
+        if suffix == ".xlsx":
+            rows = self._rows_from_xlsx(csv_path)
+        else:
+            with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+                sample = f.read(4096)
+                f.seek(0)
+                delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t").delimiter if sample else ","
+                reader = csv.DictReader(f, delimiter=delimiter)
+                rows = list(reader)
+
+        if not rows:
+            return ParsedFileData(points=points, manual_mu=manual_mu, sigma_targets=sigma_targets, vthbl_by_chip=vthbl_by_chip)
+
+        key_chip = self._pick_key(rows[0], "chip", "ic")
+        key_th = self._pick_key(rows[0], "threshold", "th")
+        key_dac = self._pick_key(rows[0], "dac", "bestdac")
+        key_hits = self._pick_key(rows[0], "hitspers", "hitss", "hits_per_s", "maxhitspers")
+        key_sigma = self._pick_key(rows[0], "sigmaest", "sigma_auto", "sigmaauto")
+        key_mu_user = self._pick_key(rows[0], "muuserdac", "mu_manual", "mumanual")
+        key_target_hits = self._pick_key(rows[0], "targethitsrequested")
+        key_target_dac = self._pick_key(rows[0], "targetdacforhits")
+        key_target_hits_found = self._pick_key(rows[0], "targethitsfound")
+        key_n_sigma = self._pick_key(rows[0], "nsigmafrommu")
+        key_sigma_ref = self._pick_key(rows[0], "sigmaref")
+        key_vthbl = self._pick_key(rows[0], "vthbl", "vth_bl", "vthbaseline", "vth_baseline")
+
+        if not all([key_chip, key_th, key_dac, key_hits]):
+            raise ValueError("Colonnes attendues (ou alias): chip/ic, threshold/th, dac/best_dac, hits_per_s/max_hits_per_s")
+
+        for row in rows:
+            chip_raw = self._to_int(row, key_chip, 0)
+            chip = chip_raw - 1 if chip_raw > 0 else chip_raw
+            if chip not in (0, 1, 2):
+                continue
+
+            th = self._to_int(row, key_th, 0)
+            if th not in (0, 1, 2):
+                continue
+
+            points.append(
+                CsvPoint(
+                    source=csv_path.stem,
+                    chip=chip,
+                    threshold=th,
+                    dac=self._to_int(row, key_dac, 0),
+                    hits_per_s=self._to_float(row, key_hits, 0.0),
+                    mode=self._infer_mode(csv_path, row),
+                    sigma_est=self._to_float(row, key_sigma, 0.0) if key_sigma else None,
+                    vth_bl=self._to_optional_int(row, key_vthbl),
+                )
+            )
+
+            key = (chip, th)
+            mu_user_val = self._to_optional_int(row, key_mu_user)
+            if mu_user_val is not None:
+                manual_mu[key] = mu_user_val
+            vth_val = self._to_optional_int(row, key_vthbl)
+            if vth_val is not None:
+                vthbl_by_chip[chip] = vth_val
+
+            target_dac_val = self._to_optional_int(row, key_target_dac)
+            target_hits_found_val = self._to_optional_float(row, key_target_hits_found)
+            if target_dac_val is not None and target_hits_found_val is not None:
+                target_hits_val = self._to_optional_float(row, key_target_hits)
+                if target_hits_val is None:
+                    target_hits_val = target_hits_found_val
+                sigma_targets[key] = SigmaTargetResult(
+                    chip=chip,
+                    threshold=th,
+                    mu_dac=manual_mu.get(key, mu_user_val if mu_user_val is not None else target_dac_val),
+                    target_hits=target_hits_val,
+                    target_dac=target_dac_val,
+                    target_hits_found=target_hits_found_val,
+                    n_sigma=self._to_optional_float(row, key_n_sigma),
+                    sigma_ref=self._to_optional_float(row, key_sigma_ref),
                 )
 
-            for row in reader:
-                chip_raw = self._to_int(row, "chip", 0)
-                chip = chip_raw - 1 if chip_raw > 0 else chip_raw
-                if chip not in (0, 1, 2):
-                    continue
+        return ParsedFileData(points=points, manual_mu=manual_mu, sigma_targets=sigma_targets, vthbl_by_chip=vthbl_by_chip)
 
-                th = self._to_int(row, "threshold", 0)
-                if th not in (0, 1, 2):
-                    continue
+    def refresh_summary_table(self):
+        if not hasattr(self, "summary_tree"):
+            return
+        for item in self.summary_tree.get_children():
+            self.summary_tree.delete(item)
 
-                points.append(
-                    CsvPoint(
-                        source=csv_path.stem,
-                        chip=chip,
-                        threshold=th,
-                        dac=self._to_int(row, "dac", 0),
-                        hits_per_s=self._to_float(row, "hits_per_s", 0.0),
-                        mode=self._infer_mode(csv_path, row),
-                    )
+        for chip in range(3):
+            for th in range(3):
+                key = (chip, th)
+                mu = self.manual_mu_by_chip_th.get(key)
+                tgt = self.sigma_targets_by_chip_th.get(key)
+                vth = self.vthbl_by_chip.get(chip)
+                self.summary_tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        f"IC{chip + 1}",
+                        f"TH{th}",
+                        "" if vth is None else vth,
+                        "" if mu is None else mu,
+                        "" if tgt is None else tgt.target_dac,
+                        "" if tgt is None else f"{tgt.target_hits:.2f}",
+                        "" if tgt is None or tgt.n_sigma is None else f"{tgt.n_sigma:.2f}",
+                    ),
                 )
-        return points
 
     def refresh_plot(self):
         self.ax.clear()
@@ -229,6 +511,7 @@ class CsvOverlayViewer(tk.Tk):
         self.ax.set_xlabel("DAC")
         self.ax.set_ylabel("Hits/s")
         self.ax.set_title("Superposition des courbes")
+        self.ax.set_xlim(255, 0)
         self.plotted_artists.clear()
 
         chip = self.chip_var.get() - 1
@@ -255,24 +538,139 @@ class CsvOverlayViewer(tk.Tk):
             line = self.ax.plot(xs, ys, marker=markers.get(th, "o"), linewidth=1.3, label=label)[0]
             self.plotted_artists.append((line, pts_sorted))
 
+            mu_key = (chip, th)
+            if mu_key in self.manual_mu_by_chip_th:
+                mu_dac = self.manual_mu_by_chip_th[mu_key]
+                self.ax.axvline(mu_dac, linestyle="--", linewidth=1.0, color=line.get_color(), alpha=0.8)
+
+            target = self.sigma_targets_by_chip_th.get((chip, th))
+            if target is not None:
+                self.ax.scatter(
+                    [target.target_dac],
+                    [target.target_hits_found],
+                    marker="X",
+                    s=80,
+                    color=line.get_color(),
+                    edgecolors="black",
+                    linewidths=0.5,
+                    zorder=4,
+                )
+                txt = f"TH{th} → DAC {target.target_dac}"
+                self.ax.annotate(
+                    txt,
+                    (target.target_dac, target.target_hits_found),
+                    textcoords="offset points",
+                    xytext=(6, 6),
+                    fontsize=8,
+                    color=line.get_color(),
+                )
+
         self.ax.legend(fontsize=8)
         self.canvas.draw_idle()
+
+    def _nearest_point(self, x: float, y: float) -> CsvPoint | None:
+        best = None
+        best_d2 = None
+        for _line, pts in self.plotted_artists:
+            for p in pts:
+                dx = p.dac - x
+                dy = p.hits_per_s - y
+                d2 = dx * dx + dy * dy
+                if best_d2 is None or d2 < best_d2:
+                    best_d2 = d2
+                    best = p
+        return best
+
+    def on_mouse_click(self, event):
+        if not self.pick_mu_mode.get():
+            return
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            return
+        best = self._nearest_point(event.xdata, event.ydata)
+        if best is None:
+            return
+
+        self.manual_mu_by_chip_th[(best.chip, best.threshold)] = best.dac
+        self.sigma_targets_by_chip_th.pop((best.chip, best.threshold), None)
+        self.status_var.set(f"µ manuel défini: IC{best.chip + 1} TH{best.threshold} -> DAC={best.dac}")
+        self.refresh_summary_table()
+        self.refresh_plot()
+
+    def compute_sigma_targets(self):
+        if not self.points:
+            messagebox.showinfo("µ-xσ", "Aucune donnée chargée.")
+            return
+        try:
+            target_hits = float(self.target_hits_var.get())
+        except Exception:
+            messagebox.showerror("µ-xσ", "Valeur hits/s cible invalide.")
+            return
+
+        if not self.manual_mu_by_chip_th:
+            messagebox.showinfo("µ-xσ", "Définis au moins un µ manuel (clic sur un point).")
+            return
+
+        lines: list[str] = []
+        self.sigma_targets_by_chip_th.clear()
+        for (chip, th), mu_dac in sorted(self.manual_mu_by_chip_th.items()):
+            pts = [p for p in self.points if p.chip == chip and p.threshold == th]
+            if not pts:
+                continue
+            pts_sorted = sorted(pts, key=lambda p: abs(p.dac - mu_dac))
+            under = [p for p in pts_sorted if p.hits_per_s <= target_hits]
+            target_point = under[0] if under else min(pts, key=lambda p: p.hits_per_s)
+
+            sigma_vals = [p.sigma_est for p in pts if p.sigma_est is not None and p.sigma_est > 0]
+            sigma_ref = statistics.median(sigma_vals) if sigma_vals else None
+
+            if sigma_ref and sigma_ref > 0:
+                n_sigma = (mu_dac - target_point.dac) / sigma_ref
+                self.sigma_targets_by_chip_th[(chip, th)] = SigmaTargetResult(
+                    chip=chip,
+                    threshold=th,
+                    mu_dac=mu_dac,
+                    target_hits=target_hits,
+                    target_dac=target_point.dac,
+                    target_hits_found=target_point.hits_per_s,
+                    n_sigma=n_sigma,
+                    sigma_ref=sigma_ref,
+                )
+                lines.append(
+                    f"IC{chip + 1} TH{th}: µ={mu_dac}, cible≤{target_hits:.3f} hits/s à DAC={target_point.dac} "
+                    f"(~µ-{n_sigma:.2f}σ, σ≈{sigma_ref:.2f})"
+                )
+            else:
+                delta = mu_dac - target_point.dac
+                self.sigma_targets_by_chip_th[(chip, th)] = SigmaTargetResult(
+                    chip=chip,
+                    threshold=th,
+                    mu_dac=mu_dac,
+                    target_hits=target_hits,
+                    target_dac=target_point.dac,
+                    target_hits_found=target_point.hits_per_s,
+                    n_sigma=None,
+                    sigma_ref=None,
+                )
+                lines.append(
+                    f"IC{chip + 1} TH{th}: µ={mu_dac}, cible≤{target_hits:.3f} hits/s à DAC={target_point.dac} "
+                    f"(écart µ-DAC={delta}, sigma non disponible)"
+                )
+
+        if not lines:
+            messagebox.showinfo("µ-xσ", "Aucun résultat exploitable.")
+            return
+
+        msg = "\n".join(lines)
+        self.info_var.set(lines[0])
+        self.refresh_summary_table()
+        self.refresh_plot()
+        messagebox.showinfo("Estimation µ-xσ", msg)
 
     def on_mouse_move(self, event):
         if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
             return
 
-        best = None
-        best_d2 = None
-
-        for _line, pts in self.plotted_artists:
-            for p in pts:
-                dx = p.dac - event.xdata
-                dy = p.hits_per_s - event.ydata
-                d2 = dx * dx + dy * dy
-                if best_d2 is None or d2 < best_d2:
-                    best_d2 = d2
-                    best = p
+        best = self._nearest_point(event.xdata, event.ydata)
 
         if best is None:
             return
