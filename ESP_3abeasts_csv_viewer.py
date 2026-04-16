@@ -1,6 +1,8 @@
 import csv
 from dataclasses import dataclass
 from pathlib import Path
+from zipfile import ZipFile
+import xml.etree.ElementTree as ET
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -102,8 +104,13 @@ class CsvOverlayViewer(tk.Tk):
 
     def load_csv_files(self):
         files = filedialog.askopenfilenames(
-            title="Choisir un ou plusieurs CSV",
-            filetypes=[("CSV", "*.csv"), ("Tous les fichiers", "*.*")],
+            title="Choisir un ou plusieurs fichiers de données",
+            filetypes=[
+                ("Données", "*.csv *.xlsx"),
+                ("CSV", "*.csv"),
+                ("Excel", "*.xlsx"),
+                ("Tous les fichiers", "*.*"),
+            ],
         )
         if not files:
             return
@@ -191,36 +198,123 @@ class CsvOverlayViewer(tk.Tk):
             return "gaussian"
         return "unknown"
 
+    @staticmethod
+    def _normalize_key(value: str) -> str:
+        return "".join(ch for ch in str(value).strip().lower() if ch.isalnum())
+
+    def _pick_key(self, row: dict, *aliases: str) -> str | None:
+        if not row:
+            return None
+        normalized = {self._normalize_key(k): k for k in row.keys()}
+        for alias in aliases:
+            if alias in normalized:
+                return normalized[alias]
+        return None
+
+    def _rows_from_xlsx(self, xlsx_path: Path) -> list[dict]:
+        rows: list[dict] = []
+        with ZipFile(xlsx_path) as zf:
+            shared_strings: list[str] = []
+            if "xl/sharedStrings.xml" in zf.namelist():
+                ss_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+                for si in ss_root.findall(".//{*}si"):
+                    txt = "".join(node.text or "" for node in si.findall(".//{*}t"))
+                    shared_strings.append(txt)
+
+            wb_root = ET.fromstring(zf.read("xl/workbook.xml"))
+            sheet_nodes = wb_root.findall(".//{*}sheet")
+            if not sheet_nodes:
+                return rows
+            first_sheet_rid = sheet_nodes[0].attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+            if not first_sheet_rid:
+                return rows
+
+            rels_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+            target = None
+            for rel in rels_root.findall(".//{*}Relationship"):
+                if rel.attrib.get("Id") == first_sheet_rid:
+                    target = rel.attrib.get("Target")
+                    break
+            if not target:
+                return rows
+
+            if target.startswith("/"):
+                sheet_path = target.lstrip("/")
+            else:
+                sheet_path = f"xl/{target}" if not target.startswith("xl/") else target
+
+            sheet_root = ET.fromstring(zf.read(sheet_path))
+
+            header: list[str] = []
+            for row in sheet_root.findall(".//{*}sheetData/{*}row"):
+                values: list[str] = []
+                for c in row.findall("{*}c"):
+                    v = c.find("{*}v")
+                    if v is None:
+                        values.append("")
+                        continue
+                    raw = v.text or ""
+                    if c.attrib.get("t") == "s":
+                        try:
+                            values.append(shared_strings[int(raw)])
+                        except Exception:
+                            values.append(raw)
+                    else:
+                        values.append(raw)
+
+                if not header:
+                    header = [str(h).strip() for h in values]
+                    continue
+                if not any(str(x).strip() for x in values):
+                    continue
+                padded = values + [""] * max(0, len(header) - len(values))
+                rows.append(dict(zip(header, padded)))
+        return rows
+
     def _read_csv(self, csv_path: Path) -> list[CsvPoint]:
         points: list[CsvPoint] = []
-        with csv_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            needed = {"chip", "threshold", "dac", "hits_per_s"}
-            if not needed.issubset(set(reader.fieldnames or [])):
-                raise ValueError(
-                    "Colonnes attendues: chip, threshold, dac, hits_per_s (fichier noise_scan_raw.csv recommandé)"
+        suffix = csv_path.suffix.lower()
+        if suffix == ".xlsx":
+            rows = self._rows_from_xlsx(csv_path)
+        else:
+            with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+                sample = f.read(4096)
+                f.seek(0)
+                delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t").delimiter if sample else ","
+                reader = csv.DictReader(f, delimiter=delimiter)
+                rows = list(reader)
+
+        if not rows:
+            return points
+
+        key_chip = self._pick_key(rows[0], "chip", "ic")
+        key_th = self._pick_key(rows[0], "threshold", "th")
+        key_dac = self._pick_key(rows[0], "dac", "bestdac")
+        key_hits = self._pick_key(rows[0], "hitspers", "hitss", "hits_per_s", "maxhitspers")
+
+        if not all([key_chip, key_th, key_dac, key_hits]):
+            raise ValueError("Colonnes attendues (ou alias): chip/ic, threshold/th, dac/best_dac, hits_per_s/max_hits_per_s")
+
+        for row in rows:
+            chip_raw = self._to_int(row, key_chip, 0)
+            chip = chip_raw - 1 if chip_raw > 0 else chip_raw
+            if chip not in (0, 1, 2):
+                continue
+
+            th = self._to_int(row, key_th, 0)
+            if th not in (0, 1, 2):
+                continue
+
+            points.append(
+                CsvPoint(
+                    source=csv_path.stem,
+                    chip=chip,
+                    threshold=th,
+                    dac=self._to_int(row, key_dac, 0),
+                    hits_per_s=self._to_float(row, key_hits, 0.0),
+                    mode=self._infer_mode(csv_path, row),
                 )
-
-            for row in reader:
-                chip_raw = self._to_int(row, "chip", 0)
-                chip = chip_raw - 1 if chip_raw > 0 else chip_raw
-                if chip not in (0, 1, 2):
-                    continue
-
-                th = self._to_int(row, "threshold", 0)
-                if th not in (0, 1, 2):
-                    continue
-
-                points.append(
-                    CsvPoint(
-                        source=csv_path.stem,
-                        chip=chip,
-                        threshold=th,
-                        dac=self._to_int(row, "dac", 0),
-                        hits_per_s=self._to_float(row, "hits_per_s", 0.0),
-                        mode=self._infer_mode(csv_path, row),
-                    )
-                )
+            )
         return points
 
     def refresh_plot(self):
