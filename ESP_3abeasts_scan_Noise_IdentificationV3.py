@@ -1,4 +1,7 @@
 import math
+import argparse
+import subprocess
+import sys
 import threading
 import time
 import csv
@@ -33,6 +36,8 @@ VTHBL_REG = 3
 THRESHOLD_REGS = [4, 5, 6]     # TH0, TH1, TH2
 COUNTER_INDEXES = [0, 1, 2]    # c0, c1, c2
 COUNTER_MOD = 1 << 24
+ANALYSIS_GAUSSIAN = "gaussian"
+ANALYSIS_SIGMOID = "sigmoid"
 
 
 @dataclass
@@ -264,6 +269,8 @@ class NoiseScanEngine:
             do_zero_each_point,
             use_mux,
             mux_value,
+            analysis_mode,
+            thresholds,
             output_dir=None,
             chips=None,
             stop_on_zero=False,
@@ -279,7 +286,7 @@ class NoiseScanEngine:
 
         self.thread = threading.Thread(
             target=self._run,
-            args=(dwell_s, settle_s, do_zero_each_point, use_mux, mux_value, output_dir, chips, stop_on_zero, max_zero, dac_ranges),
+            args=(dwell_s, settle_s, do_zero_each_point, use_mux, mux_value, analysis_mode, thresholds, output_dir, chips, stop_on_zero, max_zero, dac_ranges),
             daemon=True,
         )
         self.thread.start()
@@ -326,6 +333,8 @@ class NoiseScanEngine:
             do_zero_each_point,
             use_mux,
             mux_value,
+            analysis_mode,
+            thresholds,
             output_dir,
             chips,
             stop_on_zero,
@@ -338,16 +347,16 @@ class NoiseScanEngine:
                 reply = self.fw.set_mux(mux_value)
                 self.log(f"MUX reply: {reply}")
 
-            total_scans = len(chips) * NUM_THRESHOLDS
+            total_scans = len(chips) * len(thresholds)
             scan_index = 0
             if dac_ranges is None:
                 dac_ranges = {
                     (chip, th): (255, 0)
                     for chip in chips
-                    for th in range(NUM_THRESHOLDS)
+                    for th in thresholds
                 }
             for chip in chips:
-                for th in range(NUM_THRESHOLDS):
+                for th in thresholds:
                     if self.stop_event.is_set():
                         self.on_status("Scan stopped by user")
                         return
@@ -435,7 +444,13 @@ class NoiseScanEngine:
                         if stop_on_zero and zero_hits_streak >= max_zero:
                             self.log(f"{max_zero} DAC consécutifs à 0 hits → stop TH")
                             break
-                        mu_est, sigma_est, r2_est = self._fit_gaussian_estimate(xs, ys)
+                        if analysis_mode == ANALYSIS_SIGMOID:
+                            inflect_est, sigmoid_r2 = self._fit_sigmoid_inflection(xs, ys)
+                            mu_est = inflect_est
+                            sigma_est = None
+                            r2_est = sigmoid_r2
+                        else:
+                            mu_est, sigma_est, r2_est = self._fit_gaussian_estimate(xs, ys)
 
 
                         # if r2_est is not None and r2_est > 0.92:
@@ -456,7 +471,11 @@ class NoiseScanEngine:
                         self.last_results.append(point)
                         self.on_point(point)
 
-                    final_mu, final_sigma, final_r2 = self._fit_gaussian_estimate(xs, ys)
+                    if analysis_mode == ANALYSIS_SIGMOID:
+                        final_inflect, final_r2 = self._fit_sigmoid_inflection(xs, ys)
+                        final_mu, final_sigma = final_inflect, None
+                    else:
+                        final_mu, final_sigma, final_r2 = self._fit_gaussian_estimate(xs, ys)
                     if output_dir:
                         self._save_plot(output_dir, chip, th, xs, ys)
                     mu_minus_3sigma = None
@@ -466,11 +485,13 @@ class NoiseScanEngine:
                     self.summary_rows.append({
                         "chip": chip + 1,
                         "threshold": th,
+                        "analysis_mode": analysis_mode,
                         "points": len(xs),
-                        "mu_auto": final_mu,
+                        "mu_auto": final_mu if analysis_mode == ANALYSIS_GAUSSIAN else None,
                         "sigma_auto": final_sigma,
                         "r2_auto": final_r2,
                         "mu_minus_3sigma_auto": mu_minus_3sigma,
+                        "inflection_auto": final_mu if analysis_mode == ANALYSIS_SIGMOID else None,
                         "best_dac": self._best_dac(xs, ys),
                         "max_hits_per_s": max(ys) if ys else None,
                     })
@@ -524,12 +545,47 @@ class NoiseScanEngine:
         sigma_dac = int(round(sigma))
         return mu_dac, sigma_dac, r2
 
+    @staticmethod
+    def _fit_sigmoid_inflection(xs: list[int], ys: list[float]) -> tuple[int | None, float | None]:
+        if len(xs) < 5 or len(ys) < 5:
+            return None, None
+
+        pairs = [(float(x), float(y)) for x, y in zip(xs, ys)]
+        pairs.sort(key=lambda p: p[0])
+        x = [p[0] for p in pairs]
+        y = [p[1] for p in pairs]
+
+        y_min = min(y)
+        y_max = max(y)
+        amp = y_max - y_min
+        if amp <= 1e-9:
+            return None, None
+
+        mid = y_min + 0.5 * amp
+        idx = min(range(len(y)), key=lambda i: abs(y[i] - mid))
+        x0 = x[idx]
+
+        x_left = x[0]
+        x_right = x[-1]
+        scale = max((x_right - x_left) / 8.0, 1.0)
+
+        y_hat = [y_min + amp / (1.0 + math.exp(-(xx - x0) / scale)) for xx in x]
+        y_mean = sum(y) / len(y)
+        ss_res = sum((yy - yhh) ** 2 for yy, yhh in zip(y, y_hat))
+        ss_tot = sum((yy - y_mean) ** 2 for yy in y)
+        r2 = 0.0 if ss_tot <= 1e-12 else 1.0 - (ss_res / ss_tot)
+
+        return int(round(x0)), r2
+
     def save_results(
         self,
         outdir: Path,
         manual_selections: dict[tuple[int, int], dict[str, int | None]],
+        selected_chips: set[int] | None = None,
     ):
         outdir.mkdir(parents=True, exist_ok=True)
+        if selected_chips is None:
+            selected_chips = set(range(NUM_CHIPS))
 
         raw_path = outdir / "noise_scan_raw.csv"
         with raw_path.open("w", newline="", encoding="utf-8") as f:
@@ -540,6 +596,8 @@ class NoiseScanEngine:
                 "mu_est", "sigma_est", "r2_est"
             ])
             for p in self.last_results:
+                if p.chip not in selected_chips:
+                    continue
                 wr.writerow([
                     p.chip + 1,
                     p.threshold,
@@ -559,37 +617,45 @@ class NoiseScanEngine:
             wr.writerow([
                 "chip",
                 "threshold",
+                "analysis_mode",
                 "points",
                 "mu_auto",
                 "sigma_auto",
                 "r2_auto",
                 "mu_minus_3sigma_auto",
+                "inflection_auto",
                 "best_dac",
                 "max_hits_per_s",
                 "mu_manual",
                 "mu_minus_3sigma_manual",
+                "inflection_manual",
             ])
 
             for row in self.summary_rows:
                 key = (row["chip"] - 1, row["threshold"])
+                if key[0] not in selected_chips:
+                    continue
                 sel = manual_selections.get(key, {})
                 wr.writerow([
                     row["chip"],
                     row["threshold"],
+                    row.get("analysis_mode"),
                     row["points"],
                     row["mu_auto"],
                     row["sigma_auto"],
                     row["r2_auto"],
                     row["mu_minus_3sigma_auto"],
+                    row.get("inflection_auto"),
                     row["best_dac"],
                     row["max_hits_per_s"],
                     sel.get("mu"),
                     sel.get("mu_minus_3sigma"),
+                    sel.get("inflection"),
                 ])
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, auto_port: str | None = None):
         super().__init__()
         self.title("AlphaBeast Serial Noise Scan GUI")
         self.geometry("1400x900")
@@ -611,9 +677,20 @@ class App(tk.Tk):
         self.axes = {}
         self.canvases = {}
         self.lines_by_chip_th = {}
+        self.last_analysis_mode = ANALYSIS_GAUSSIAN
         self._build_ui()
         self.refresh_ports()
+        if auto_port:
+            self.port_var.set(auto_port)
+            self.after(250, self._auto_connect_port)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _auto_connect_port(self):
+        if self.fw.is_open():
+            return
+        if not self.port_var.get().strip():
+            return
+        self.toggle_connect()
     def pause_scan(self):
         self.engine.pause()
         self._log("Scan paused")
@@ -681,6 +758,14 @@ class App(tk.Tk):
         self.port_cb = ttk.Combobox(conn, textvariable=self.port_var, width=18, state="readonly")
         self.port_cb.grid(row=0, column=1, padx=4)
         ttk.Button(conn, text="Refresh", command=self.refresh_ports).grid(row=0, column=2, padx=4)
+        ttk.Label(conn, text="Multi-ESP").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.multi_ports_listbox = tk.Listbox(conn, selectmode=tk.MULTIPLE, height=4, exportselection=False)
+        self.multi_ports_listbox.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(
+            conn,
+            text="Open selected in new windows",
+            command=self.open_selected_ports_in_new_windows,
+        ).grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 0))
 
         ttk.Label(conn, text="Baud").grid(row=1, column=0, sticky="w")
         self.baud_var = tk.StringVar(value="115200")
@@ -772,6 +857,32 @@ class App(tk.Tk):
         self.zero_streak_var = tk.StringVar(value="2")
         ttk.Entry(scan, textvariable=self.zero_streak_var, width=10).grid(row=7, column=1, sticky="w")
 
+        analysis_tabs_box = ttk.LabelFrame(scan, text="Analyses", padding=6)
+        analysis_tabs_box.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        self.analysis_notebook = ttk.Notebook(analysis_tabs_box)
+        self.analysis_notebook.pack(fill=tk.BOTH, expand=True)
+
+        noise_tab = ttk.Frame(self.analysis_notebook, padding=6)
+        signal_tab = ttk.Frame(self.analysis_notebook, padding=6)
+        self.analysis_notebook.add(noise_tab, text="Analyse bruit")
+        self.analysis_notebook.add(signal_tab, text="Analyse signal")
+
+        ttk.Label(
+            noise_tab,
+            text="Scan gaussien automatique sur TH0..TH2\nEstimation µ/σ pour chaque IC et chaque TH.",
+            justify=tk.LEFT,
+        ).pack(anchor="w")
+
+        ttk.Label(signal_tab, text="TH à scanner pour la sigmoïde").pack(anchor="w")
+        th_sel_frame = ttk.Frame(signal_tab)
+        th_sel_frame.pack(anchor="w", pady=(4, 0))
+        self.signal_th_vars = []
+        for th in range(NUM_THRESHOLDS):
+            var = tk.BooleanVar(value=True)
+            self.signal_th_vars.append(var)
+            ttk.Checkbutton(th_sel_frame, text=f"TH{th}", variable=var).pack(side=tk.LEFT, padx=(0, 6))
+
 
         actions = ttk.LabelFrame(top, text="Actions", padding=8)
         actions.pack(side=tk.LEFT, fill=tk.Y)
@@ -792,6 +903,15 @@ class App(tk.Tk):
         ttk.Button(actions, text="Suivant sans sélectionner", command=self.skip_and_next).pack(fill=tk.X, pady=2)
 
         ttk.Separator(actions, orient="horizontal").pack(fill=tk.X, pady=6)
+
+        export_box = ttk.LabelFrame(actions, text="Export CSV (IC)", padding=4)
+        export_box.pack(fill=tk.X, pady=(0, 4))
+        self.export_ic_vars = []
+        for i in range(NUM_CHIPS):
+            var = tk.BooleanVar(value=True)
+            self.export_ic_vars.append(var)
+            ttk.Checkbutton(export_box, text=f"IC{i + 1}", variable=var).pack(side=tk.LEFT, padx=2)
+
         ttk.Button(actions, text="Save validated CSV...", command=self.save_csv_dialog).pack(fill=tk.X, pady=2)
 
         help_box = ttk.LabelFrame(top, text="Manual validation", padding=8)
@@ -877,8 +997,26 @@ class App(tk.Tk):
     def refresh_ports(self):
         ports = [p.device for p in list_ports.comports()]
         self.port_cb["values"] = ports
+        self.multi_ports_listbox.delete(0, tk.END)
+        for p in ports:
+            self.multi_ports_listbox.insert(tk.END, p)
         if ports and not self.port_var.get():
             self.port_var.set(ports[0])
+
+    def open_selected_ports_in_new_windows(self):
+        sel = self.multi_ports_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("Multi-ESP", "Sélectionne au moins un port.")
+            return
+
+        ports = [self.multi_ports_listbox.get(i) for i in sel]
+        script = str(Path(__file__).resolve())
+        for port in ports:
+            try:
+                subprocess.Popen([sys.executable, script, "--port", port])
+                self._log(f"Opened new window for {port}")
+            except Exception as e:
+                self._log(f"Failed opening {port}: {e}")
 
     def toggle_connect(self):
 
@@ -928,9 +1066,19 @@ class App(tk.Tk):
             use_mux = bool(self.use_mux_var.get())
             mux_value = self.mux_var.get().strip()
             chips = [i for i, v in enumerate(self.ic_vars) if v.get()]
+            selected_analysis_tab = self.analysis_notebook.tab(self.analysis_notebook.select(), "text")
+            if selected_analysis_tab == "Analyse signal":
+                analysis_mode = ANALYSIS_SIGMOID
+                thresholds = [i for i, v in enumerate(self.signal_th_vars) if v.get()]
+            else:
+                analysis_mode = ANALYSIS_GAUSSIAN
+                thresholds = list(range(NUM_THRESHOLDS))
+            self.last_analysis_mode = analysis_mode
 
             if not chips:
                 raise RuntimeError("Aucun IC sélectionné")
+            if analysis_mode == ANALYSIS_SIGMOID and not thresholds:
+                raise RuntimeError("Aucun TH sélectionné")
 
             stop_on_zero = self.stop_on_zero_var.get()
 
@@ -955,7 +1103,8 @@ class App(tk.Tk):
             for chip in range(NUM_CHIPS):
                 self.refresh_chip_plot(chip)
 
-            self._log("Starting scan...")
+            mode_label = "gaussienne" if analysis_mode == ANALYSIS_GAUSSIAN else "sigmoïde"
+            self._log(f"Starting scan ({mode_label})...")
 
             outdir = filedialog.askdirectory(title="Optional output folder (Cancel = no autosave)")
             if not outdir:
@@ -968,6 +1117,8 @@ class App(tk.Tk):
                 do_zero_each_point=do_zero_each_point,
                 use_mux=use_mux,
                 mux_value=mux_value,
+                analysis_mode=analysis_mode,
+                thresholds=thresholds,
                 output_dir=outdir,
                 chips=chips,
                 stop_on_zero=stop_on_zero,
@@ -985,13 +1136,18 @@ class App(tk.Tk):
         if not self.engine.last_results:
             messagebox.showinfo("No data", "No acquired points to save")
             return
+        selected_chips = {i for i, v in enumerate(self.export_ic_vars) if v.get()}
+        if not selected_chips:
+            messagebox.showerror("Export error", "Sélectionne au moins un IC à exporter")
+            return
 
         outdir = filedialog.askdirectory(title="Choose output folder")
         if not outdir:
             return
 
-        self.engine.save_results(Path(outdir), self.manual_selections)
-        self._log(f"Saved validated CSV files to {outdir}")
+        self.engine.save_results(Path(outdir), self.manual_selections, selected_chips=selected_chips)
+        chips_txt = ", ".join(f"IC{i + 1}" for i in sorted(selected_chips))
+        self._log(f"Saved validated CSV files to {outdir} ({chips_txt})")
 
     def _threadsafe_log(self, msg: str):
         self.after(0, lambda: self._log(msg))
@@ -1029,7 +1185,10 @@ class App(tk.Tk):
 
     def on_scan_done(self):
         self.review_mode = True
-        self.status_var.set("Scan completed - validate µ and µ-3σ manually")
+        if self.last_analysis_mode == ANALYSIS_SIGMOID:
+            self.status_var.set("Scan completed - validate point d'inflexion manuellement (clic gauche)")
+        else:
+            self.status_var.set("Scan completed - validate µ and µ-3σ manually")
         self._log("Review mode enabled")
 
         for chip in range(NUM_CHIPS):
@@ -1127,16 +1286,21 @@ class App(tk.Tk):
 
         key = (chip, clicked_th)
         if key not in self.manual_selections:
-            self.manual_selections[key] = {"mu": None, "mu_minus_3sigma": None}
+            self.manual_selections[key] = {"mu": None, "mu_minus_3sigma": None, "inflection": None}
 
         # bouton gauche / droit
         is_left = (event.button == 1) or (event.button == MouseButton.LEFT)
         is_right = (event.button == 3) or (event.button == MouseButton.RIGHT)
 
         if is_left:
-            self.manual_selections[key]["mu"] = selected_dac
-            self._log(f"Manual µ selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
-            self.status_var.set(f"µ selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
+            if self.last_analysis_mode == ANALYSIS_SIGMOID:
+                self.manual_selections[key]["inflection"] = selected_dac
+                self._log(f"Manual inflection selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
+                self.status_var.set(f"Inflection selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
+            else:
+                self.manual_selections[key]["mu"] = selected_dac
+                self._log(f"Manual µ selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
+                self.status_var.set(f"µ selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
         elif is_right:
             self.manual_selections[key]["mu_minus_3sigma"] = selected_dac
             self._log(f"Manual µ-3σ selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
@@ -1180,6 +1344,7 @@ class App(tk.Tk):
             sel = self.manual_selections.get(key, {})
             mu_sel = sel.get("mu")
             mu3_sel = sel.get("mu_minus_3sigma")
+            inflection_sel = sel.get("inflection")
 
             for p in pts:
                 if mu_sel is not None and p.dac == mu_sel:
@@ -1189,6 +1354,10 @@ class App(tk.Tk):
                 if mu3_sel is not None and p.dac == mu3_sel:
                     ax.plot([p.dac], [p.hits_per_s], marker="s", markersize=11, linestyle="None")
                     ax.annotate(f"µ-3σ TH{th}", (p.dac, p.hits_per_s), textcoords="offset points", xytext=(8, -14))
+
+                if inflection_sel is not None and p.dac == inflection_sel:
+                    ax.plot([p.dac], [p.hits_per_s], marker="D", markersize=10, linestyle="None")
+                    ax.annotate(f"Infl. TH{th}", (p.dac, p.hits_per_s), textcoords="offset points", xytext=(8, 16))
 
         if all_x and all_y:
             xmin = min(all_x)
@@ -1219,5 +1388,8 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = App()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", default=None, help="Auto-connect serial port at startup (for multi-ESP windows)")
+    args = parser.parse_args()
+    app = App(auto_port=args.port)
     app.mainloop()
