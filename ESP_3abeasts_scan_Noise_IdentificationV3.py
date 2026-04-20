@@ -45,6 +45,7 @@ class ScanPoint:
     chip: int
     threshold: int
     dac: int
+    vth_bl: int | None
     hits_per_s: float
     count0: int
     count1: int
@@ -195,13 +196,26 @@ class FirmwareSerialText:
             timeout=timeout,
         )
 
+    def read_esp_id(self, timeout: float = 2.0) -> int | None:
+        reply = self.send_and_expect_one_of(
+            "ID?",
+            accepted_prefixes=["ESP_abeast_ID=", "ERR"],
+            timeout=timeout,
+        )
+        if reply.startswith("ERR") or "=" not in reply:
+            return None
+        try:
+            return int(reply.split("=", 1)[1].strip())
+        except Exception:
+            return None
+
     def read_cntcsv(self, timeout: float = 2.0) -> dict[int, tuple[int, int, int]]:
         with self.lock:
             self._require_open()
             self.clear_input()
             self._write_line("CNTCSV")
 
-            lines: list[str] = []
+            parsed: dict[int, tuple[int, int, int]] = {}
             t0 = time.time()
 
             while time.time() - t0 < timeout:
@@ -222,25 +236,12 @@ class FirmwareSerialText:
                     continue
 
                 if 0 <= chip < NUM_CHIPS:
-                    lines.append((chip, c0, c1, c2))
+                    parsed[chip] = (c0, c1, c2)
 
-                    # 🔥 dès qu'on a les 3 chips → stop
-                    if len(lines) == NUM_CHIPS:
-                        break
+                    if len(parsed) == NUM_CHIPS:
+                        return parsed
 
-            if len(lines) != NUM_CHIPS:
-                raise RuntimeError(f"CNTCSV timeout or incomplete data: {lines}")
-
-            # 🔥 reconstruction propre (évite mélange ordre)
-            parsed: dict[int, tuple[int, int, int]] = {}
-            for chip, c0, c1, c2 in lines:
-                parsed[chip] = (c0, c1, c2)
-
-            # 🔥 sécurité : vérifier qu'on a bien 0,1,2
-            if set(parsed.keys()) != set(range(NUM_CHIPS)):
-                raise RuntimeError(f"CNTCSV corrupted frame: {parsed}")
-
-            return parsed
+            raise RuntimeError(f"CNTCSV timeout or incomplete data: {parsed}")
 
 
 class NoiseScanEngine:
@@ -256,6 +257,17 @@ class NoiseScanEngine:
         self.summary_rows: list[dict] = []
         self.pause_event = threading.Event()
         self.skip_threshold_event = threading.Event()
+        self.scan_vthbl_by_chip: dict[int, int] = {}
+        self.session_esp_id: int | None = None
+        self.current_analysis_mode: str = ANALYSIS_GAUSSIAN
+
+    def set_session_info(self, esp_id: int | None):
+        self.session_esp_id = esp_id
+
+    def _file_prefix(self) -> str:
+        mode_tag = "signal" if self.current_analysis_mode == ANALYSIS_SIGMOID else "noise"
+        esp_tag = f"ESP{self.session_esp_id}" if self.session_esp_id is not None else "ESP_unknown"
+        return f"{esp_tag}_{mode_tag}"
     def is_running(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
 
@@ -267,6 +279,7 @@ class NoiseScanEngine:
             dwell_s,
             settle_s,
             do_zero_each_point,
+            dac_step,
             use_mux,
             mux_value,
             analysis_mode,
@@ -276,6 +289,7 @@ class NoiseScanEngine:
             stop_on_zero=False,
             max_zero=2,
             dac_ranges=None,
+            vthbl_values=None,
     ):
         if self.is_running():
             raise RuntimeError("A scan is already running")
@@ -283,10 +297,12 @@ class NoiseScanEngine:
         self.stop_event.clear()
         self.last_results = []
         self.summary_rows = []
+        self.scan_vthbl_by_chip = dict(vthbl_values or {})
+        self.current_analysis_mode = analysis_mode
 
         self.thread = threading.Thread(
             target=self._run,
-            args=(dwell_s, settle_s, do_zero_each_point, use_mux, mux_value, analysis_mode, thresholds, output_dir, chips, stop_on_zero, max_zero, dac_ranges),
+            args=(dwell_s, settle_s, do_zero_each_point, dac_step, use_mux, mux_value, analysis_mode, thresholds, output_dir, chips, stop_on_zero, max_zero, dac_ranges),
             daemon=True,
         )
         self.thread.start()
@@ -318,7 +334,7 @@ class NoiseScanEngine:
             # 🔥 IMPORTANT : axes propres
             plt.gca().xaxis.set_major_locator(plt.MaxNLocator(integer=True))
 
-            filename = Path(output_dir) / f"IC{chip + 1}_TH{th}.png"
+            filename = Path(output_dir) / f"{self._file_prefix()}_IC{chip + 1}_TH{th}.png"
             plt.savefig(filename, dpi=150)
             plt.close()
 
@@ -331,6 +347,7 @@ class NoiseScanEngine:
             dwell_s,
             settle_s,
             do_zero_each_point,
+            dac_step,
             use_mux,
             mux_value,
             analysis_mode,
@@ -373,9 +390,13 @@ class NoiseScanEngine:
                     zero_hits_streak = 0
                     dac_min, dac_max = dac_ranges[(chip, th)]
 
-                    step = -1 if dac_min > dac_max else 1
+                    direction = -1 if dac_min > dac_max else 1
+                    scan_step = max(1, int(abs(dac_step))) * direction
+                    dac_values = list(range(dac_min, dac_max + direction, scan_step))
+                    if not dac_values or dac_values[-1] != dac_max:
+                        dac_values.append(dac_max)
 
-                    for dac in range(dac_min, dac_max + step, step):
+                    for dac in dac_values:
 
                         if self.stop_event.is_set():
                             self.on_status("Scan stopped by user")
@@ -460,6 +481,7 @@ class NoiseScanEngine:
                             chip=chip,
                             threshold=th,
                             dac=dac,
+                            vth_bl=self.scan_vthbl_by_chip.get(chip),
                             hits_per_s=rate,
                             count0=c0,
                             count1=c1,
@@ -485,6 +507,7 @@ class NoiseScanEngine:
                     self.summary_rows.append({
                         "chip": chip + 1,
                         "threshold": th,
+                        "vth_bl": self.scan_vthbl_by_chip.get(chip),
                         "analysis_mode": analysis_mode,
                         "points": len(xs),
                         "mu_auto": final_mu if analysis_mode == ANALYSIS_GAUSSIAN else None,
@@ -587,11 +610,11 @@ class NoiseScanEngine:
         if selected_chips is None:
             selected_chips = set(range(NUM_CHIPS))
 
-        raw_path = outdir / "noise_scan_raw.csv"
+        raw_path = outdir / f"{self._file_prefix()}_scan_raw.csv"
         with raw_path.open("w", newline="", encoding="utf-8") as f:
             wr = csv.writer(f)
             wr.writerow([
-                "chip", "threshold", "dac", "hits_per_s",
+                "chip", "threshold", "vth_bl", "dac", "hits_per_s",
                 "count0", "count1", "dt_s",
                 "mu_est", "sigma_est", "r2_est"
             ])
@@ -601,6 +624,7 @@ class NoiseScanEngine:
                 wr.writerow([
                     p.chip + 1,
                     p.threshold,
+                    p.vth_bl,
                     p.dac,
                     p.hits_per_s,
                     p.count0,
@@ -611,12 +635,13 @@ class NoiseScanEngine:
                     p.r2_est,
                 ])
 
-        summary_path = outdir / "noise_scan_summary_validated.csv"
+        summary_path = outdir / f"{self._file_prefix()}_scan_summary_validated.csv"
         with summary_path.open("w", newline="", encoding="utf-8") as f:
             wr = csv.writer(f)
             wr.writerow([
                 "chip",
                 "threshold",
+                "vth_bl",
                 "analysis_mode",
                 "points",
                 "mu_auto",
@@ -639,6 +664,7 @@ class NoiseScanEngine:
                 wr.writerow([
                     row["chip"],
                     row["threshold"],
+                    row.get("vth_bl"),
                     row.get("analysis_mode"),
                     row["points"],
                     row["mu_auto"],
@@ -678,6 +704,9 @@ class App(tk.Tk):
         self.canvases = {}
         self.lines_by_chip_th = {}
         self.last_analysis_mode = ANALYSIS_GAUSSIAN
+        self.connected_esp_id: int | None = None
+        self.connected_port: str | None = None
+        self.scan_status = ""
         self._build_ui()
         self.refresh_ports()
         if auto_port:
@@ -823,15 +852,16 @@ class App(tk.Tk):
         ttk.Checkbutton(scan, variable=self.stop_on_zero_var).grid(row=6, column=1, sticky="w")
 
         ttk.Label(scan, text="Nb 0 consécutifs").grid(row=7, column=0, sticky="w")
+        ttk.Label(scan, text="Pas DAC").grid(row=8, column=0, sticky="w")
 
         # --- Plage DAC par threshold ---
         # --- Plages DAC par IC et TH ---
-        ttk.Label(scan, text="DAC ranges (min → max)").grid(row=8, column=0, sticky="w")
+        ttk.Label(scan, text="DAC ranges (min → max)").grid(row=9, column=0, sticky="w")
 
         self.dac_ranges = {}  # clé = (chip, th)
 
         range_frame = ttk.Frame(scan)
-        range_frame.grid(row=9, column=0, columnspan=2, sticky="w")
+        range_frame.grid(row=10, column=0, columnspan=2, sticky="w")
 
         # header TH
         for th in range(NUM_THRESHOLDS):
@@ -856,9 +886,11 @@ class App(tk.Tk):
 
         self.zero_streak_var = tk.StringVar(value="2")
         ttk.Entry(scan, textvariable=self.zero_streak_var, width=10).grid(row=7, column=1, sticky="w")
+        self.dac_step_var = tk.StringVar(value="1")
+        ttk.Entry(scan, textvariable=self.dac_step_var, width=10).grid(row=8, column=1, sticky="w")
 
         analysis_tabs_box = ttk.LabelFrame(scan, text="Analyses", padding=6)
-        analysis_tabs_box.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        analysis_tabs_box.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         self.analysis_notebook = ttk.Notebook(analysis_tabs_box)
         self.analysis_notebook.pack(fill=tk.BOTH, expand=True)
@@ -1025,7 +1057,11 @@ class App(tk.Tk):
             if self.fw.is_open():
                 self.fw.close()
                 self.connect_btn.configure(text="Connect")
-                self.status_var.set("Disconnected")
+                self.connected_esp_id = None
+                self.connected_port = None
+                self.engine.set_session_info(None)
+                self.scan_status = ""
+                self._update_status_bar()
                 self._log("Serial port closed")
                 return
 
@@ -1033,10 +1069,18 @@ class App(tk.Tk):
             baud = int(self.baud_var.get().strip())
 
             self.fw.open(port, baudrate=baud, timeout=0.2)
+            esp_id = self.fw.read_esp_id(timeout=2.0)
+            self.connected_esp_id = esp_id
+            self.connected_port = port
+            self.engine.set_session_info(esp_id)
+            self.scan_status = ""
 
             self.connect_btn.configure(text="Disconnect")
-            self.status_var.set(f"Connected to {port} @ {baud}")
-            self._log(f"Connected to {port} @ {baud}")
+            self._update_status_bar()
+            if esp_id is None:
+                self._log(f"Connected to {port} @ {baud} | ESP_abeast_ID unknown")
+            else:
+                self._log(f"Connected to {port} @ {baud} | ESP_abeast_ID={esp_id}")
 
             # 👇 AJOUTER ICI
             self.after(600, self.load_vthbl_defaults)
@@ -1051,7 +1095,7 @@ class App(tk.Tk):
             val = self.mux_var.get().strip()
             reply = self.fw.set_mux(val)
             self._log(f"MUX {val} -> {reply}")
-            self.status_var.set(f"MUX {val} selected")
+            self._set_scan_status(f"MUX {val} selected")
         except Exception as e:
             messagebox.showerror("MUX error", str(e))
 
@@ -1063,6 +1107,7 @@ class App(tk.Tk):
             dwell_s = float(self.dwell_var.get())
             settle_s = float(self.settle_var.get())
             do_zero_each_point = bool(self.zero_each_point_var.get())
+            dac_step = int(self.dac_step_var.get())
             use_mux = bool(self.use_mux_var.get())
             mux_value = self.mux_var.get().strip()
             chips = [i for i, v in enumerate(self.ic_vars) if v.get()]
@@ -1079,10 +1124,16 @@ class App(tk.Tk):
                 raise RuntimeError("Aucun IC sélectionné")
             if analysis_mode == ANALYSIS_SIGMOID and not thresholds:
                 raise RuntimeError("Aucun TH sélectionné")
+            if dac_step <= 0:
+                raise RuntimeError("Le pas DAC doit être strictement positif")
 
             stop_on_zero = self.stop_on_zero_var.get()
 
             max_zero = int(self.zero_streak_var.get())
+            vthbl_values = {
+                chip: int(self.vthbl_vars[chip].get())
+                for chip in range(NUM_CHIPS)
+            }
             # --- Récupération des plages DAC ---
             dac_ranges = {}
 
@@ -1115,6 +1166,7 @@ class App(tk.Tk):
                 dwell_s=dwell_s,
                 settle_s=settle_s,
                 do_zero_each_point=do_zero_each_point,
+                dac_step=dac_step,
                 use_mux=use_mux,
                 mux_value=mux_value,
                 analysis_mode=analysis_mode,
@@ -1124,6 +1176,7 @@ class App(tk.Tk):
                 stop_on_zero=stop_on_zero,
                 max_zero=max_zero,
                 dac_ranges=dac_ranges,
+                vthbl_values=vthbl_values,
             )
         except Exception as e:
             messagebox.showerror("Start error", str(e))
@@ -1153,7 +1206,26 @@ class App(tk.Tk):
         self.after(0, lambda: self._log(msg))
 
     def _threadsafe_status(self, msg: str):
-        self.after(0, lambda: self.status_var.set(msg))
+        self.scan_status = msg
+        self.after(0, self._update_status_bar)
+
+    def _set_scan_status(self, msg: str):
+        self.scan_status = msg
+        self._update_status_bar()
+
+    def _update_status_bar(self):
+        if self.connected_port:
+            if self.connected_esp_id is None:
+                conn = f"{self.connected_port} | ESP_ID=?"
+            else:
+                conn = f"{self.connected_port} | ESP_ID={self.connected_esp_id}"
+        else:
+            conn = "Disconnected"
+
+        if self.scan_status:
+            self.status_var.set(f"{conn}  ||  {self.scan_status}")
+        else:
+            self.status_var.set(conn)
 
     def _threadsafe_point(self, point: ScanPoint):
         self.after(0, lambda p=point: self._consume_point(p))
@@ -1186,9 +1258,9 @@ class App(tk.Tk):
     def on_scan_done(self):
         self.review_mode = True
         if self.last_analysis_mode == ANALYSIS_SIGMOID:
-            self.status_var.set("Scan completed - validate point d'inflexion manuellement (clic gauche)")
+            self._set_scan_status("Scan completed - validate point d'inflexion manuellement (clic gauche)")
         else:
-            self.status_var.set("Scan completed - validate µ and µ-3σ manually")
+            self._set_scan_status("Scan completed - validate µ and µ-3σ manually")
         self._log("Review mode enabled")
 
         for chip in range(NUM_CHIPS):
@@ -1223,7 +1295,7 @@ class App(tk.Tk):
         if current < NUM_CHIPS - 1:
             self.notebook.select(current + 1)
         else:
-            self.status_var.set("Validation finished for all ICs")
+            self._set_scan_status("Validation finished for all ICs")
             self._log("Validation finished for all ICs")
 
     def skip_and_next(self):
@@ -1236,7 +1308,7 @@ class App(tk.Tk):
         if current < NUM_CHIPS - 1:
             self.notebook.select(current + 1)
         else:
-            self.status_var.set("Validation finished for all ICs")
+            self._set_scan_status("Validation finished for all ICs")
             self._log("Validation finished for all ICs")
 
     def on_plot_click_chip(self, event, chip):
@@ -1296,15 +1368,15 @@ class App(tk.Tk):
             if self.last_analysis_mode == ANALYSIS_SIGMOID:
                 self.manual_selections[key]["inflection"] = selected_dac
                 self._log(f"Manual inflection selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
-                self.status_var.set(f"Inflection selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
+                self._set_scan_status(f"Inflection selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
             else:
                 self.manual_selections[key]["mu"] = selected_dac
                 self._log(f"Manual µ selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
-                self.status_var.set(f"µ selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
+                self._set_scan_status(f"µ selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
         elif is_right:
             self.manual_selections[key]["mu_minus_3sigma"] = selected_dac
             self._log(f"Manual µ-3σ selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
-            self.status_var.set(f"µ-3σ selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
+            self._set_scan_status(f"µ-3σ selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
         else:
             return
 
