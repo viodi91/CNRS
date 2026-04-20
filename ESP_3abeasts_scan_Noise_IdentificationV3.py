@@ -195,6 +195,19 @@ class FirmwareSerialText:
             timeout=timeout,
         )
 
+    def read_esp_id(self, timeout: float = 2.0) -> int | None:
+        reply = self.send_and_expect_one_of(
+            "ID?",
+            accepted_prefixes=["ESP_abeast_ID=", "ERR"],
+            timeout=timeout,
+        )
+        if reply.startswith("ERR") or "=" not in reply:
+            return None
+        try:
+            return int(reply.split("=", 1)[1].strip())
+        except Exception:
+            return None
+
     def read_cntcsv(self, timeout: float = 2.0) -> dict[int, tuple[int, int, int]]:
         with self.lock:
             self._require_open()
@@ -678,6 +691,9 @@ class App(tk.Tk):
         self.canvases = {}
         self.lines_by_chip_th = {}
         self.last_analysis_mode = ANALYSIS_GAUSSIAN
+        self.connected_esp_id: int | None = None
+        self.connected_port: str | None = None
+        self.scan_status = ""
         self._build_ui()
         self.refresh_ports()
         if auto_port:
@@ -1025,7 +1041,10 @@ class App(tk.Tk):
             if self.fw.is_open():
                 self.fw.close()
                 self.connect_btn.configure(text="Connect")
-                self.status_var.set("Disconnected")
+                self.connected_esp_id = None
+                self.connected_port = None
+                self.scan_status = ""
+                self._update_status_bar()
                 self._log("Serial port closed")
                 return
 
@@ -1033,10 +1052,17 @@ class App(tk.Tk):
             baud = int(self.baud_var.get().strip())
 
             self.fw.open(port, baudrate=baud, timeout=0.2)
+            esp_id = self.fw.read_esp_id(timeout=2.0)
+            self.connected_esp_id = esp_id
+            self.connected_port = port
+            self.scan_status = ""
 
             self.connect_btn.configure(text="Disconnect")
-            self.status_var.set(f"Connected to {port} @ {baud}")
-            self._log(f"Connected to {port} @ {baud}")
+            self._update_status_bar()
+            if esp_id is None:
+                self._log(f"Connected to {port} @ {baud} | ESP_abeast_ID unknown")
+            else:
+                self._log(f"Connected to {port} @ {baud} | ESP_abeast_ID={esp_id}")
 
             # 👇 AJOUTER ICI
             self.after(600, self.load_vthbl_defaults)
@@ -1051,7 +1077,7 @@ class App(tk.Tk):
             val = self.mux_var.get().strip()
             reply = self.fw.set_mux(val)
             self._log(f"MUX {val} -> {reply}")
-            self.status_var.set(f"MUX {val} selected")
+            self._set_scan_status(f"MUX {val} selected")
         except Exception as e:
             messagebox.showerror("MUX error", str(e))
 
@@ -1153,7 +1179,26 @@ class App(tk.Tk):
         self.after(0, lambda: self._log(msg))
 
     def _threadsafe_status(self, msg: str):
-        self.after(0, lambda: self.status_var.set(msg))
+        self.scan_status = msg
+        self.after(0, self._update_status_bar)
+
+    def _set_scan_status(self, msg: str):
+        self.scan_status = msg
+        self._update_status_bar()
+
+    def _update_status_bar(self):
+        if self.connected_port:
+            if self.connected_esp_id is None:
+                conn = f"{self.connected_port} | ESP_ID=?"
+            else:
+                conn = f"{self.connected_port} | ESP_ID={self.connected_esp_id}"
+        else:
+            conn = "Disconnected"
+
+        if self.scan_status:
+            self.status_var.set(f"{conn}  ||  {self.scan_status}")
+        else:
+            self.status_var.set(conn)
 
     def _threadsafe_point(self, point: ScanPoint):
         self.after(0, lambda p=point: self._consume_point(p))
@@ -1186,9 +1231,9 @@ class App(tk.Tk):
     def on_scan_done(self):
         self.review_mode = True
         if self.last_analysis_mode == ANALYSIS_SIGMOID:
-            self.status_var.set("Scan completed - validate point d'inflexion manuellement (clic gauche)")
+            self._set_scan_status("Scan completed - validate point d'inflexion manuellement (clic gauche)")
         else:
-            self.status_var.set("Scan completed - validate µ and µ-3σ manually")
+            self._set_scan_status("Scan completed - validate µ and µ-3σ manually")
         self._log("Review mode enabled")
 
         for chip in range(NUM_CHIPS):
@@ -1223,7 +1268,7 @@ class App(tk.Tk):
         if current < NUM_CHIPS - 1:
             self.notebook.select(current + 1)
         else:
-            self.status_var.set("Validation finished for all ICs")
+            self._set_scan_status("Validation finished for all ICs")
             self._log("Validation finished for all ICs")
 
     def skip_and_next(self):
@@ -1236,7 +1281,7 @@ class App(tk.Tk):
         if current < NUM_CHIPS - 1:
             self.notebook.select(current + 1)
         else:
-            self.status_var.set("Validation finished for all ICs")
+            self._set_scan_status("Validation finished for all ICs")
             self._log("Validation finished for all ICs")
 
     def on_plot_click_chip(self, event, chip):
@@ -1296,15 +1341,15 @@ class App(tk.Tk):
             if self.last_analysis_mode == ANALYSIS_SIGMOID:
                 self.manual_selections[key]["inflection"] = selected_dac
                 self._log(f"Manual inflection selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
-                self.status_var.set(f"Inflection selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
+                self._set_scan_status(f"Inflection selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
             else:
                 self.manual_selections[key]["mu"] = selected_dac
                 self._log(f"Manual µ selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
-                self.status_var.set(f"µ selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
+                self._set_scan_status(f"µ selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
         elif is_right:
             self.manual_selections[key]["mu_minus_3sigma"] = selected_dac
             self._log(f"Manual µ-3σ selected -> IC{chip + 1} TH{clicked_th}: DAC={selected_dac}")
-            self.status_var.set(f"µ-3σ selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
+            self._set_scan_status(f"µ-3σ selected: IC{chip + 1} TH{clicked_th} DAC={selected_dac}")
         else:
             return
 
