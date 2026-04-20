@@ -35,6 +35,7 @@ class CsvOverlayViewer(tk.Tk):
         self.show_th_vars = [tk.BooleanVar(value=True) for _ in range(3)]
         self.save_ic_vars = [tk.BooleanVar(value=True) for _ in range(3)]
         self.show_sigmoid_fit_var = tk.BooleanVar(value=False)
+        self.fit_enable_by_th = [tk.BooleanVar(value=False) for _ in range(3)]
         self.fit_ranges_by_th: dict[int, tuple[tk.StringVar, tk.StringVar]] = {
             th: (tk.StringVar(value="255"), tk.StringVar(value="0"))
             for th in range(3)
@@ -78,7 +79,12 @@ class CsvOverlayViewer(tk.Tk):
             min_var, max_var = self.fit_ranges_by_th[th]
             row = ttk.Frame(fit_range_box)
             row.pack(side=tk.TOP, anchor="w")
-            ttk.Label(row, text=f"TH{th}").pack(side=tk.LEFT, padx=(0, 3))
+            ttk.Checkbutton(
+                row,
+                text=f"Fit TH{th}",
+                variable=self.fit_enable_by_th[th],
+                command=self.refresh_plot,
+            ).pack(side=tk.LEFT, padx=(0, 4))
             ttk.Entry(row, textvariable=min_var, width=4).pack(side=tk.LEFT)
             ttk.Label(row, text="→").pack(side=tk.LEFT)
             ttk.Entry(row, textvariable=max_var, width=4).pack(side=tk.LEFT)
@@ -280,7 +286,12 @@ class CsvOverlayViewer(tk.Tk):
             line = self.ax.plot(xs, ys, marker=markers.get(th, "o"), linewidth=1.3, label=label)[0]
             self.plotted_artists.append((line, pts_sorted))
 
-            if self.show_sigmoid_fit_var.get() and mode == "sigmoid":
+            should_fit_curve = (
+                self.show_sigmoid_fit_var.get()
+                and mode == "sigmoid"
+                and self.fit_enable_by_th[th].get()
+            )
+            if should_fit_curve:
                 fit_min, fit_max = self._fit_range_for_threshold(th)
                 fit_pts = [p for p in pts_sorted if fit_min <= p.dac <= fit_max]
                 fit_xs = [p.dac for p in fit_pts]
@@ -297,7 +308,9 @@ class CsvOverlayViewer(tk.Tk):
 
         self.ax.legend(fontsize=8)
         if self.show_sigmoid_fit_var.get():
-            if inflection_labels:
+            if not any(v.get() for v in self.fit_enable_by_th):
+                self.status_var.set("Aucune courbe sélectionnée pour le fit (active Fit TH0/1/2).")
+            elif inflection_labels:
                 self.status_var.set("Points d'inflexion: " + " | ".join(inflection_labels))
             else:
                 self.status_var.set("Aucune courbe sigmoïde fittable avec la sélection courante.")
