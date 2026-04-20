@@ -45,6 +45,7 @@ class ScanPoint:
     chip: int
     threshold: int
     dac: int
+    vth_bl: int | None
     hits_per_s: float
     count0: int
     count1: int
@@ -269,6 +270,7 @@ class NoiseScanEngine:
         self.summary_rows: list[dict] = []
         self.pause_event = threading.Event()
         self.skip_threshold_event = threading.Event()
+        self.scan_vthbl_by_chip: dict[int, int] = {}
     def is_running(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
 
@@ -289,6 +291,7 @@ class NoiseScanEngine:
             stop_on_zero=False,
             max_zero=2,
             dac_ranges=None,
+            vthbl_values=None,
     ):
         if self.is_running():
             raise RuntimeError("A scan is already running")
@@ -296,6 +299,7 @@ class NoiseScanEngine:
         self.stop_event.clear()
         self.last_results = []
         self.summary_rows = []
+        self.scan_vthbl_by_chip = dict(vthbl_values or {})
 
         self.thread = threading.Thread(
             target=self._run,
@@ -473,6 +477,7 @@ class NoiseScanEngine:
                             chip=chip,
                             threshold=th,
                             dac=dac,
+                            vth_bl=self.scan_vthbl_by_chip.get(chip),
                             hits_per_s=rate,
                             count0=c0,
                             count1=c1,
@@ -498,6 +503,7 @@ class NoiseScanEngine:
                     self.summary_rows.append({
                         "chip": chip + 1,
                         "threshold": th,
+                        "vth_bl": self.scan_vthbl_by_chip.get(chip),
                         "analysis_mode": analysis_mode,
                         "points": len(xs),
                         "mu_auto": final_mu if analysis_mode == ANALYSIS_GAUSSIAN else None,
@@ -604,7 +610,7 @@ class NoiseScanEngine:
         with raw_path.open("w", newline="", encoding="utf-8") as f:
             wr = csv.writer(f)
             wr.writerow([
-                "chip", "threshold", "dac", "hits_per_s",
+                "chip", "threshold", "vth_bl", "dac", "hits_per_s",
                 "count0", "count1", "dt_s",
                 "mu_est", "sigma_est", "r2_est"
             ])
@@ -614,6 +620,7 @@ class NoiseScanEngine:
                 wr.writerow([
                     p.chip + 1,
                     p.threshold,
+                    p.vth_bl,
                     p.dac,
                     p.hits_per_s,
                     p.count0,
@@ -630,6 +637,7 @@ class NoiseScanEngine:
             wr.writerow([
                 "chip",
                 "threshold",
+                "vth_bl",
                 "analysis_mode",
                 "points",
                 "mu_auto",
@@ -652,6 +660,7 @@ class NoiseScanEngine:
                 wr.writerow([
                     row["chip"],
                     row["threshold"],
+                    row.get("vth_bl"),
                     row.get("analysis_mode"),
                     row["points"],
                     row["mu_auto"],
@@ -1109,6 +1118,10 @@ class App(tk.Tk):
             stop_on_zero = self.stop_on_zero_var.get()
 
             max_zero = int(self.zero_streak_var.get())
+            vthbl_values = {
+                chip: int(self.vthbl_vars[chip].get())
+                for chip in range(NUM_CHIPS)
+            }
             # --- Récupération des plages DAC ---
             dac_ranges = {}
 
@@ -1150,6 +1163,7 @@ class App(tk.Tk):
                 stop_on_zero=stop_on_zero,
                 max_zero=max_zero,
                 dac_ranges=dac_ranges,
+                vthbl_values=vthbl_values,
             )
         except Exception as e:
             messagebox.showerror("Start error", str(e))
