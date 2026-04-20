@@ -282,6 +282,7 @@ class NoiseScanEngine:
             dwell_s,
             settle_s,
             do_zero_each_point,
+            dac_step,
             use_mux,
             mux_value,
             analysis_mode,
@@ -303,7 +304,7 @@ class NoiseScanEngine:
 
         self.thread = threading.Thread(
             target=self._run,
-            args=(dwell_s, settle_s, do_zero_each_point, use_mux, mux_value, analysis_mode, thresholds, output_dir, chips, stop_on_zero, max_zero, dac_ranges),
+            args=(dwell_s, settle_s, do_zero_each_point, dac_step, use_mux, mux_value, analysis_mode, thresholds, output_dir, chips, stop_on_zero, max_zero, dac_ranges),
             daemon=True,
         )
         self.thread.start()
@@ -348,6 +349,7 @@ class NoiseScanEngine:
             dwell_s,
             settle_s,
             do_zero_each_point,
+            dac_step,
             use_mux,
             mux_value,
             analysis_mode,
@@ -390,9 +392,13 @@ class NoiseScanEngine:
                     zero_hits_streak = 0
                     dac_min, dac_max = dac_ranges[(chip, th)]
 
-                    step = -1 if dac_min > dac_max else 1
+                    direction = -1 if dac_min > dac_max else 1
+                    scan_step = max(1, int(abs(dac_step))) * direction
+                    dac_values = list(range(dac_min, dac_max + direction, scan_step))
+                    if not dac_values or dac_values[-1] != dac_max:
+                        dac_values.append(dac_max)
 
-                    for dac in range(dac_min, dac_max + step, step):
+                    for dac in dac_values:
 
                         if self.stop_event.is_set():
                             self.on_status("Scan stopped by user")
@@ -848,15 +854,16 @@ class App(tk.Tk):
         ttk.Checkbutton(scan, variable=self.stop_on_zero_var).grid(row=6, column=1, sticky="w")
 
         ttk.Label(scan, text="Nb 0 consécutifs").grid(row=7, column=0, sticky="w")
+        ttk.Label(scan, text="Pas DAC").grid(row=8, column=0, sticky="w")
 
         # --- Plage DAC par threshold ---
         # --- Plages DAC par IC et TH ---
-        ttk.Label(scan, text="DAC ranges (min → max)").grid(row=8, column=0, sticky="w")
+        ttk.Label(scan, text="DAC ranges (min → max)").grid(row=9, column=0, sticky="w")
 
         self.dac_ranges = {}  # clé = (chip, th)
 
         range_frame = ttk.Frame(scan)
-        range_frame.grid(row=9, column=0, columnspan=2, sticky="w")
+        range_frame.grid(row=10, column=0, columnspan=2, sticky="w")
 
         # header TH
         for th in range(NUM_THRESHOLDS):
@@ -881,9 +888,11 @@ class App(tk.Tk):
 
         self.zero_streak_var = tk.StringVar(value="2")
         ttk.Entry(scan, textvariable=self.zero_streak_var, width=10).grid(row=7, column=1, sticky="w")
+        self.dac_step_var = tk.StringVar(value="1")
+        ttk.Entry(scan, textvariable=self.dac_step_var, width=10).grid(row=8, column=1, sticky="w")
 
         analysis_tabs_box = ttk.LabelFrame(scan, text="Analyses", padding=6)
-        analysis_tabs_box.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        analysis_tabs_box.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         self.analysis_notebook = ttk.Notebook(analysis_tabs_box)
         self.analysis_notebook.pack(fill=tk.BOTH, expand=True)
@@ -1098,6 +1107,7 @@ class App(tk.Tk):
             dwell_s = float(self.dwell_var.get())
             settle_s = float(self.settle_var.get())
             do_zero_each_point = bool(self.zero_each_point_var.get())
+            dac_step = int(self.dac_step_var.get())
             use_mux = bool(self.use_mux_var.get())
             mux_value = self.mux_var.get().strip()
             chips = [i for i, v in enumerate(self.ic_vars) if v.get()]
@@ -1114,6 +1124,8 @@ class App(tk.Tk):
                 raise RuntimeError("Aucun IC sélectionné")
             if analysis_mode == ANALYSIS_SIGMOID and not thresholds:
                 raise RuntimeError("Aucun TH sélectionné")
+            if dac_step <= 0:
+                raise RuntimeError("Le pas DAC doit être strictement positif")
 
             stop_on_zero = self.stop_on_zero_var.get()
 
@@ -1154,6 +1166,7 @@ class App(tk.Tk):
                 dwell_s=dwell_s,
                 settle_s=settle_s,
                 do_zero_each_point=do_zero_each_point,
+                dac_step=dac_step,
                 use_mux=use_mux,
                 mux_value=mux_value,
                 analysis_mode=analysis_mode,
