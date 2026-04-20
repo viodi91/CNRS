@@ -35,6 +35,10 @@ class CsvOverlayViewer(tk.Tk):
         self.show_th_vars = [tk.BooleanVar(value=True) for _ in range(3)]
         self.save_ic_vars = [tk.BooleanVar(value=True) for _ in range(3)]
         self.show_sigmoid_fit_var = tk.BooleanVar(value=False)
+        self.fit_ranges_by_th: dict[int, tuple[tk.StringVar, tk.StringVar]] = {
+            th: (tk.StringVar(value="255"), tk.StringVar(value="0"))
+            for th in range(3)
+        }
 
         self._build_ui()
 
@@ -67,6 +71,17 @@ class CsvOverlayViewer(tk.Tk):
             variable=self.show_sigmoid_fit_var,
             command=self.refresh_plot,
         ).pack(side=tk.LEFT, padx=(12, 0))
+
+        fit_range_box = ttk.LabelFrame(top, text="Plage fit (par TH)", padding=4)
+        fit_range_box.pack(side=tk.LEFT, padx=(12, 0))
+        for th in range(3):
+            min_var, max_var = self.fit_ranges_by_th[th]
+            row = ttk.Frame(fit_range_box)
+            row.pack(side=tk.TOP, anchor="w")
+            ttk.Label(row, text=f"TH{th}").pack(side=tk.LEFT, padx=(0, 3))
+            ttk.Entry(row, textvariable=min_var, width=4).pack(side=tk.LEFT)
+            ttk.Label(row, text="→").pack(side=tk.LEFT)
+            ttk.Entry(row, textvariable=max_var, width=4).pack(side=tk.LEFT)
 
         save_box = ttk.LabelFrame(top, text="Enregistrer données (IC)", padding=4)
         save_box.pack(side=tk.LEFT, padx=(16, 0))
@@ -237,6 +252,7 @@ class CsvOverlayViewer(tk.Tk):
         self.ax.set_xlabel("DAC")
         self.ax.set_ylabel("Hits/s")
         self.ax.set_title("Superposition des courbes")
+        self.ax.set_xlim(255, 0)
         self.plotted_artists.clear()
 
         chip = self.chip_var.get() - 1
@@ -265,7 +281,11 @@ class CsvOverlayViewer(tk.Tk):
             self.plotted_artists.append((line, pts_sorted))
 
             if self.show_sigmoid_fit_var.get() and mode == "sigmoid":
-                fit = self._fit_sigmoid_curve(xs, ys)
+                fit_min, fit_max = self._fit_range_for_threshold(th)
+                fit_pts = [p for p in pts_sorted if fit_min <= p.dac <= fit_max]
+                fit_xs = [p.dac for p in fit_pts]
+                fit_ys = [p.hits_per_s for p in fit_pts]
+                fit = self._fit_sigmoid_curve(fit_xs, fit_ys)
                 if fit is None:
                     continue
                 fit_x, fit_y, x0, y0, r2 = fit
@@ -297,12 +317,33 @@ class CsvOverlayViewer(tk.Tk):
         if amp <= 1e-9:
             return None
 
-        mid = y_min + 0.5 * amp
-        idx_mid = min(range(len(y)), key=lambda i: abs(y[i] - mid))
-        x0 = x[idx_mid]
         x_left = x[0]
         x_right = x[-1]
-        scale = max((x_right - x_left) / 8.0, 1.0)
+        if abs(x_right - x_left) < 1e-9:
+            return None
+
+        # inflexion estimée par pente maximale sur la plage sélectionnée
+        best_i = None
+        best_slope = None
+        for i in range(len(x) - 1):
+            dx = x[i + 1] - x[i]
+            if abs(dx) < 1e-12:
+                continue
+            slope = (y[i + 1] - y[i]) / dx
+            if best_slope is None or abs(slope) > abs(best_slope):
+                best_slope = slope
+                best_i = i
+
+        if best_i is None or best_slope is None:
+            return None
+
+        x0 = 0.5 * (x[best_i] + x[best_i + 1])
+        slope0 = best_slope
+        if abs(slope0) < 1e-12:
+            return None
+
+        # pour une logistique: pente max = amp / (4*scale)
+        scale = max(abs(amp / (4.0 * slope0)), 0.5)
 
         x_fit = [x_left + i * (x_right - x_left) / 200.0 for i in range(201)]
         y_fit = [y_min + amp / (1.0 + math.exp(-(xx - x0) / scale)) for xx in x_fit]
@@ -314,6 +355,15 @@ class CsvOverlayViewer(tk.Tk):
         r2 = 0.0 if ss_tot <= 1e-12 else 1.0 - (ss_res / ss_tot)
         y0 = y_min + amp / 2.0
         return x_fit, y_fit, x0, y0, r2
+
+    def _fit_range_for_threshold(self, threshold: int) -> tuple[int, int]:
+        min_var, max_var = self.fit_ranges_by_th[threshold]
+        try:
+            a = int(min_var.get())
+            b = int(max_var.get())
+        except Exception:
+            return 0, 255
+        return (a, b) if a <= b else (b, a)
 
     def on_mouse_move(self, event):
         if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
