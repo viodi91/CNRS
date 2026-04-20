@@ -1,4 +1,5 @@
 import csv
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,6 +34,7 @@ class CsvOverlayViewer(tk.Tk):
         self.chip_var = tk.IntVar(value=1)
         self.show_th_vars = [tk.BooleanVar(value=True) for _ in range(3)]
         self.save_ic_vars = [tk.BooleanVar(value=True) for _ in range(3)]
+        self.show_sigmoid_fit_var = tk.BooleanVar(value=False)
 
         self._build_ui()
 
@@ -59,6 +61,12 @@ class CsvOverlayViewer(tk.Tk):
 
         ttk.Button(top, text="Rafraîchir", command=self.refresh_plot).pack(side=tk.LEFT, padx=8)
         ttk.Button(top, text="Effacer", command=self.clear_data).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(
+            top,
+            text="Fitter sigmoïde + inflexion",
+            variable=self.show_sigmoid_fit_var,
+            command=self.refresh_plot,
+        ).pack(side=tk.LEFT, padx=(12, 0))
 
         save_box = ttk.LabelFrame(top, text="Enregistrer données (IC)", padding=4)
         save_box.pack(side=tk.LEFT, padx=(16, 0))
@@ -245,6 +253,7 @@ class CsvOverlayViewer(tk.Tk):
             grouped.setdefault(key, []).append(p)
 
         markers = {0: "o", 1: "s", 2: "^"}
+        inflection_labels: list[str] = []
         for (source, th, mode), pts in sorted(grouped.items()):
             pts_sorted = sorted(pts, key=lambda x: x.dac)
             xs = [p.dac for p in pts_sorted]
@@ -255,8 +264,56 @@ class CsvOverlayViewer(tk.Tk):
             line = self.ax.plot(xs, ys, marker=markers.get(th, "o"), linewidth=1.3, label=label)[0]
             self.plotted_artists.append((line, pts_sorted))
 
+            if self.show_sigmoid_fit_var.get() and mode == "sigmoid":
+                fit = self._fit_sigmoid_curve(xs, ys)
+                if fit is None:
+                    continue
+                fit_x, fit_y, x0, y0, r2 = fit
+                fit_label = f"{source} | TH{th} | fit S (x0={x0:.1f})"
+                self.ax.plot(fit_x, fit_y, linestyle="--", linewidth=1.2, color=line.get_color(), alpha=0.9, label=fit_label)
+                self.ax.axvline(x=x0, color=line.get_color(), linestyle=":", linewidth=1.2, alpha=0.9)
+                self.ax.plot([x0], [y0], marker="D", markersize=6, color=line.get_color())
+                inflection_labels.append(f"{source} TH{th}: x0={x0:.1f} (R²={r2:.3f})")
+
         self.ax.legend(fontsize=8)
+        if self.show_sigmoid_fit_var.get():
+            if inflection_labels:
+                self.status_var.set("Points d'inflexion: " + " | ".join(inflection_labels))
+            else:
+                self.status_var.set("Aucune courbe sigmoïde fittable avec la sélection courante.")
         self.canvas.draw_idle()
+
+    @staticmethod
+    def _fit_sigmoid_curve(xs: list[int], ys: list[float]) -> tuple[list[float], list[float], float, float, float] | None:
+        if len(xs) < 5 or len(ys) < 5:
+            return None
+
+        pairs = sorted((float(x), float(y)) for x, y in zip(xs, ys))
+        x = [p[0] for p in pairs]
+        y = [p[1] for p in pairs]
+        y_min = min(y)
+        y_max = max(y)
+        amp = y_max - y_min
+        if amp <= 1e-9:
+            return None
+
+        mid = y_min + 0.5 * amp
+        idx_mid = min(range(len(y)), key=lambda i: abs(y[i] - mid))
+        x0 = x[idx_mid]
+        x_left = x[0]
+        x_right = x[-1]
+        scale = max((x_right - x_left) / 8.0, 1.0)
+
+        x_fit = [x_left + i * (x_right - x_left) / 200.0 for i in range(201)]
+        y_fit = [y_min + amp / (1.0 + math.exp(-(xx - x0) / scale)) for xx in x_fit]
+        y_hat = [y_min + amp / (1.0 + math.exp(-(xx - x0) / scale)) for xx in x]
+
+        y_mean = sum(y) / len(y)
+        ss_res = sum((yy - yh) ** 2 for yy, yh in zip(y, y_hat))
+        ss_tot = sum((yy - y_mean) ** 2 for yy in y)
+        r2 = 0.0 if ss_tot <= 1e-12 else 1.0 - (ss_res / ss_tot)
+        y0 = y_min + amp / 2.0
+        return x_fit, y_fit, x0, y0, r2
 
     def on_mouse_move(self, event):
         if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
